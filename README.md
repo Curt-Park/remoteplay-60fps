@@ -94,6 +94,10 @@ they appear as short holds.
   upscale of each pair waits until that point has passed.
 - The interpolator's 1/3–2/3 mode takes about 35 ms here, too slow to fill long gaps.
 
+## License
+
+MIT. See [LICENSE](LICENSE).
+
 ## Trademarks
 
 PlayStation, PS5 and PS Remote Play are trademarks of Sony Interactive Entertainment. This project
