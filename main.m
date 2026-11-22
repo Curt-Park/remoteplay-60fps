@@ -7,6 +7,7 @@
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
+#import <Metal/Metal.h>
 
 // The interpolator accepts 1280x720 and 1920x1080 only, and 1080p takes about 100 ms on an M1.
 static const NSInteger kProcessWidth = 1280, kProcessHeight = 720;
@@ -53,6 +54,7 @@ static NSString *FourCC(OSType code) {
 @interface Smoother : NSObject <SCStreamOutput, SCStreamDelegate, SCContentSharingPickerObserver, NSWindowDelegate>
 @property NSString *match;        // nil = ask with the system window picker
 @property BOOL passthrough;
+@property double sharpness;       // unsharp-mask strength applied to every shown frame; 0 = off
 @property BOOL logStalls;         // print gaps of 0.12-3 s in source frames and in shown frames
 @property double cropTop;         // points cut from the top of the captured window; negative = automatic
 @property BOOL debugDiff;
@@ -71,6 +73,12 @@ static NSString *FourCC(OSType code) {
     CVPixelBufferPoolRef _pool;
     VTFrameProcessor *_scaler;
     CVPixelBufferPoolRef _scaledPool;
+    id<MTLDevice> _metalDevice;
+    id<MTLCommandQueue> _metalQueue;
+    id<MTLComputePipelineState> _sharpenPipeline;
+    CVMetalTextureCacheRef _textureCache;
+    CVPixelBufferPoolRef _sharpPool;
+    size_t _sharpWidth;
     CVPixelBufferRef _previousFrame;
     double _previousTime;
     uint8_t *_previousSamples;
@@ -434,7 +442,20 @@ static NSString *FourCC(OSType code) {
 }
 
 // Returns a retained buffer: the super-resolved frame, or the input itself when scaling is off or fails.
+// Returns a retained frame ready for display: super-resolved when upscaling is on, then sharpened.
 - (CVPixelBufferRef)upscaled:(CVPixelBufferRef)buffer {
+    double begin = HostNow();
+    CVPixelBufferRef result = [self superResolved:buffer];
+    if (self.sharpness > 0) {
+        CVPixelBufferRef sharper = [self sharpened:result];
+        if (sharper) { CVPixelBufferRelease(result); result = sharper; }
+    }
+    if (result != buffer) { _scaleSum += HostNow() - begin; _scaled++; }
+    return result;
+}
+
+// Returns a retained buffer: the super-resolved frame, or the input itself when scaling is off or fails.
+- (CVPixelBufferRef)superResolved:(CVPixelBufferRef)buffer {
     if (!_scaler) return CVPixelBufferRetain(buffer);
     double begin = HostNow();
     CVPixelBufferRef destination = NULL;
@@ -451,9 +472,81 @@ static NSString *FourCC(OSType code) {
         CVPixelBufferRelease(destination);
         return CVPixelBufferRetain(buffer);
     }
-    _scaleSum += HostNow() - begin;
-    _scaled++;
     return destination;
+}
+
+// Unsharp mask on the luma plane: each pixel is pushed away from a small blur of its surroundings. The video
+// stream carries little detail beyond 720p, so no upscaler recovers more; raising edge contrast is what makes
+// the picture read as sharper. The push is capped so strong edges do not grow halos.
+// Returns a retained buffer, or NULL when sharpening is unavailable.
+- (CVPixelBufferRef)sharpened:(CVPixelBufferRef)source {
+    static NSString *const shader = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        "kernel void sharpen(texture2d<float, access::sample> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]],\n"
+        "                    constant float &amount [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {\n"
+        "    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;\n"
+        "    constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);\n"
+        "    float2 size = float2(src.get_width(), src.get_height());\n"
+        "    float2 uv = (float2(gid) + 0.5) / size, o = 1.25 / size;\n"
+        "    float c = src.sample(s, uv).r;\n"
+        "    float blur = 0.25 * (src.sample(s, uv + o).r + src.sample(s, uv - o).r +\n"
+        "                         src.sample(s, uv + float2(o.x, -o.y)).r + src.sample(s, uv + float2(-o.x, o.y)).r);\n"
+        "    dst.write(float4(saturate(c + clamp((c - blur) * amount, -0.10, 0.10)), 0, 0, 1), gid);\n"
+        "}\n";
+    size_t width = CVPixelBufferGetWidth(source), height = CVPixelBufferGetHeight(source);
+    if (!_metalDevice) {
+        _metalDevice = MTLCreateSystemDefaultDevice();
+        _metalQueue = [_metalDevice newCommandQueue];
+        NSError *error = nil;
+        id<MTLLibrary> library = [_metalDevice newLibraryWithSource:shader options:nil error:&error];
+        id<MTLFunction> function = [library newFunctionWithName:@"sharpen"];
+        _sharpenPipeline = function ? [_metalDevice newComputePipelineStateWithFunction:function error:&error] : nil;
+        CVMetalTextureCacheCreate(NULL, NULL, _metalDevice, NULL, &_textureCache);
+        if (!_sharpenPipeline) fprintf(stderr, "Sharpening is unavailable: %s\n", error.localizedDescription.UTF8String);
+    }
+    if (!_sharpenPipeline || !CVPixelBufferIsPlanar(source)) return NULL;
+    if (!_sharpPool || _sharpWidth != width) {
+        CVPixelBufferPoolRelease(_sharpPool);
+        NSDictionary *attributes = @{(id)kCVPixelBufferWidthKey: @(width), (id)kCVPixelBufferHeightKey: @(height),
+                                     (id)kCVPixelBufferPixelFormatTypeKey: @(CVPixelBufferGetPixelFormatType(source)),
+                                     (id)kCVPixelBufferIOSurfacePropertiesKey: @{}, (id)kCVPixelBufferMetalCompatibilityKey: @YES};
+        CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)attributes, &_sharpPool);
+        _sharpWidth = width;
+    }
+    CVPixelBufferRef output = NULL;
+    CVPixelBufferPoolCreatePixelBuffer(NULL, _sharpPool, &output);
+    if (!output) return NULL;
+    CVMetalTextureRef lumaIn = NULL, lumaOut = NULL, chromaIn = NULL, chromaOut = NULL;
+    CVMetalTextureCacheCreateTextureFromImage(NULL, _textureCache, source, NULL, MTLPixelFormatR8Unorm, width, height, 0, &lumaIn);
+    CVMetalTextureCacheCreateTextureFromImage(NULL, _textureCache, output, NULL, MTLPixelFormatR8Unorm, width, height, 0, &lumaOut);
+    CVMetalTextureCacheCreateTextureFromImage(NULL, _textureCache, source, NULL, MTLPixelFormatRG8Unorm, width / 2, height / 2, 1, &chromaIn);
+    CVMetalTextureCacheCreateTextureFromImage(NULL, _textureCache, output, NULL, MTLPixelFormatRG8Unorm, width / 2, height / 2, 1, &chromaOut);
+    BOOL ok = lumaIn && lumaOut && chromaIn && chromaOut;
+    if (ok) {
+        id<MTLCommandBuffer> commands = [_metalQueue commandBuffer];
+        id<MTLComputeCommandEncoder> compute = [commands computeCommandEncoder];
+        float amount = (float)self.sharpness;
+        [compute setComputePipelineState:_sharpenPipeline];
+        [compute setTexture:CVMetalTextureGetTexture(lumaIn) atIndex:0];
+        [compute setTexture:CVMetalTextureGetTexture(lumaOut) atIndex:1];
+        [compute setBytes:&amount length:sizeof(amount) atIndex:0];
+        NSUInteger groupWidth = _sharpenPipeline.threadExecutionWidth, groupHeight = _sharpenPipeline.maxTotalThreadsPerThreadgroup / groupWidth;
+        [compute dispatchThreadgroups:MTLSizeMake((width + groupWidth - 1) / groupWidth, (height + groupHeight - 1) / groupHeight, 1)
+                threadsPerThreadgroup:MTLSizeMake(groupWidth, groupHeight, 1)];
+        [compute endEncoding];
+        id<MTLBlitCommandEncoder> blit = [commands blitCommandEncoder];
+        [blit copyFromTexture:CVMetalTextureGetTexture(chromaIn) toTexture:CVMetalTextureGetTexture(chromaOut)];
+        [blit endEncoding];
+        [commands commit];
+        [commands waitUntilCompleted];
+        ok = commands.error == nil;
+        CVBufferPropagateAttachments(source, output);
+    }
+    if (lumaIn) CFRelease(lumaIn);
+    if (lumaOut) CFRelease(lumaOut);
+    if (chromaIn) CFRelease(chromaIn);
+    if (chromaOut) CFRelease(chromaOut);
+    if (!ok) { CVPixelBufferRelease(output); return NULL; }
+    return output;
 }
 
 - (void)makeOutputWindow {
@@ -772,7 +865,7 @@ static NSString *FourCC(OSType code) {
             // refreshes (measured on screen), so the second upscale waits until that point has passed.
             double sinceComposite = fmod(HostNow() - captureTime, period);
             double untilComposite = period - sinceComposite;
-            if (untilComposite < 0.008) usleep((useconds_t)((untilComposite + 0.002) * 1e6));
+            if (untilComposite < 0.010) usleep((useconds_t)((untilComposite + 0.002) * 1e6));
         }
         CVPixelBufferRef frameOut = [self upscaled:frame];   // off the critical path: the middle frame is already on its way
         first = MAX(first, refreshAtOrAfter(HostNow() + kCommitLead));
@@ -827,7 +920,9 @@ int main(int argc, const char *argv[]) {
         smoother.cushion = 1;
         smoother.cropTop = -1;
         smoother.logStalls = YES;
+        smoother.sharpness = 1.5;   // chosen by eye on game frames: clearly crisper, while 2.5 starts to amplify compression noise
         double seconds = 0;
+        BOOL lowLatency = NO, sharpnessGiven = NO;
         for (int i = 1; i < argc; i++) {
             NSString *flag = @(argv[i]);
             NSString *value = i + 1 < argc ? @(argv[i + 1]) : nil;
@@ -835,14 +930,17 @@ int main(int argc, const char *argv[]) {
             // 720p; the spare refresh is given back whenever the source is steady (33-50 ms).
             else if ([flag isEqual:@"--no-upscale"]) { smoother.upscale = NO; smoother.steady = NO; }
             // 720p and no spare refresh at all: always 33 ms, at the price of a hold whenever a source frame is late.
-            else if ([flag isEqual:@"--low-latency"]) { smoother.upscale = NO; smoother.steady = NO; smoother.cushion = 0; }
+            else if ([flag isEqual:@"--low-latency"]) { smoother.upscale = NO; smoother.steady = NO; smoother.cushion = 0; lowLatency = YES; }
             else if ([flag isEqual:@"--crop-top"] && value) { smoother.cropTop = value.doubleValue; i++; }
+            else if ([flag isEqual:@"--sharpen"] && value) { smoother.sharpness = value.doubleValue; sharpnessGiven = YES; i++; }
             else if ([flag isEqual:@"--no-stalls"]) smoother.logStalls = NO;
             else if ([flag isEqual:@"--passthrough"]) smoother.passthrough = YES;
             else if ([flag isEqual:@"--debug-diff"]) smoother.debugDiff = YES;
             else if ([flag isEqual:@"--seconds"] && value) { seconds = value.doubleValue; i++; }
             else { fprintf(stderr, "Unknown or incomplete option: %s\n", argv[i]); return 2; }
         }
+        // Sharpening takes 1-2 ms, which the 33 ms schedule cannot always spare.
+        if (lowLatency && !sharpnessGiven) smoother.sharpness = 0;
         NSApplication *app = NSApplication.sharedApplication;
         app.activationPolicy = NSApplicationActivationPolicyRegular;
         NSMenu *bar = [NSMenu new], *menu = [NSMenu new];

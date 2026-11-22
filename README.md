@@ -3,10 +3,10 @@
 Real-time 30 → 60 fps frame interpolation for any window on macOS.
 
 It captures a window you pick, generates the frame halfway between each pair of source frames,
-upscales the result to 1080p, and shows it in its own window. It was built to play 30 fps PS5 games
+upscales and sharpens the result to 1080p, and shows it in its own window. It was built to play 30 fps PS5 games
 over PS Remote Play at 60 fps, but works on any window.
 
-Apple frameworks only (ScreenCaptureKit, VideoToolbox, Core Animation). One Objective-C file, no
+Apple frameworks only (ScreenCaptureKit, VideoToolbox, Metal, Core Animation). One Objective-C file, no
 dependencies.
 
 ## Requirements
@@ -49,6 +49,7 @@ uneven frame arrival does not show, 50 ms behind the source window.
 | `--match <text>` | Skip the picker and capture the app whose name or bundle id contains the text |
 | `--no-upscale` | 720p output, and the spare refresh is given back whenever the source is steady: 33–50 ms behind |
 | `--low-latency` | 720p output and no spare refresh: always 33 ms behind, but a late source frame shows as a one-refresh hold |
+| `--sharpen <n>` | Sharpening strength, default 1.5; 0 turns it off (the default with `--low-latency`). Above about 2.5 it starts to amplify compression noise |
 | `--crop-top <pt>` | Capture the whole window minus exactly this many points at the top, and turn off picture-area detection |
 | `--no-stalls` | Do not print stalls. By default every gap of 0.12–3 s is printed: `source:` when the captured window did not change, `output:` when frames arrived but were not shown |
 | `--passthrough` | No interpolation, for comparison |
@@ -80,7 +81,9 @@ across refreshes; a 30 fps source reads about 30 and under 15 %.
    mistaken for repeats.
 3. **Interpolate** the midpoint with `VTLowLatencyFrameInterpolation`. A scene cut (a difference far
    above the recent motion level) is shown without a middle frame.
-4. **Upscale** to 1080p with `VTLowLatencySuperResolutionScaler`.
+4. **Upscale** to 1080p with `VTLowLatencySuperResolutionScaler`, then **sharpen** with an unsharp mask on
+   the luma plane (a Metal compute pass, about 2 ms). A game stream carries little detail beyond 720p,
+   so raising edge contrast does more for apparent sharpness than any further upscaling.
 5. **Schedule** every frame for one specific display refresh and commit its `IOSurface` as layer
    contents for that refresh.
 
@@ -90,7 +93,7 @@ across refreshes; a 30 fps source reads about 30 and under 15 %.
 |---|---|
 | Interpolation, 1280×720 | 6–9 ms per frame |
 | Interpolation, 1920×1080 | about 100 ms: not usable. Sizes in between are rejected |
-| Upscale 720p → 1080p | 4–6 ms per frame |
+| Upscale 720p → 1080p plus sharpening | 6–7 ms per frame |
 | Delay behind the source window | 50 ms (three refreshes); 33 ms with `--low-latency` |
 | On-screen output | 56–60 changes per second |
 
@@ -118,7 +121,10 @@ they appear as short holds.
   - A second upscale with MetalFX, 1080p → 1440p: about 5–6 ms more per frame, which no longer fits. Output
     fell to 25–45 fps and the delay grew to 65–160 ms.
   - A Core Image sharpening filter on the output layer: the compositor then showed 24–29 fps.
-  - A cheap halo-free luma sharpening pass (about 2 ms, pacing unaffected): the difference was barely visible.
+  - Sharpening that never lets a pixel pass its darkest or brightest neighbour (no halos at all): the
+    difference was barely visible. The unsharp mask now in use allows a capped overshoot instead.
+  - Lanczos instead of bilinear for the final scale to the panel: no visible difference.
+  - Adding large-radius local contrast on top of the unsharp mask: more punch, but dark halos around figures.
   - Capturing at 1080p and showing real frames untouched, with only middle frames going through 720p: pacing
     held, but on the same frame native 1080p looked no sharper than 720p plus super resolution. The detail
     limit is the video stream itself, not the 720p processing size.
