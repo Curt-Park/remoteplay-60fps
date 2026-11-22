@@ -41,13 +41,14 @@ captured whole, minus a standard title bar.
 If the captured app replaces its window (Remote Play does this when a session starts or goes full
 screen), the app's largest window is followed automatically.
 
+With no options it runs for the best picture: 1080p output and one spare refresh of delay kept so
+uneven frame arrival does not show, 50 ms behind the source window.
+
 | Option | Effect |
 |---|---|
 | `--match <text>` | Skip the picker and capture the app whose name or bundle id contains the text |
-| `--fullscreen` | Start in full screen |
-| `--no-upscale` | Show frames at 720p. By default every shown frame is super-resolved to 1080p, which costs one more refresh of delay (50 ms instead of 33 ms) |
-| `--cushion 0` | Lowest delay; a late source frame shows as a one-refresh hold. Meant for use with `--no-upscale` |
-| `--steady` | Keep one spare refresh of delay permanently for the steadiest pacing |
+| `--no-upscale` | 720p output, and the spare refresh is given back whenever the source is steady: 33–50 ms behind |
+| `--low-latency` | 720p output and no spare refresh: always 33 ms behind, but a late source frame shows as a one-refresh hold |
 | `--crop-top <pt>` | Capture the whole window minus exactly this many points at the top, and turn off picture-area detection |
 | `--no-stalls` | Do not print stalls. By default every gap of 0.12–3 s is printed: `source:` when the captured window did not change, `output:` when frames arrived but were not shown |
 | `--passthrough` | No interpolation, for comparison |
@@ -77,7 +78,7 @@ across refreshes; a 30 fps source reads about 30 and under 15 %.
    mistaken for repeats.
 3. **Interpolate** the midpoint with `VTLowLatencyFrameInterpolation`. A scene cut (a difference far
    above the recent motion level) is shown without a middle frame.
-4. **Upscale** to 1080p with `VTLowLatencySuperResolutionScaler` (unless `--no-upscale`).
+4. **Upscale** to 1080p with `VTLowLatencySuperResolutionScaler`.
 5. **Schedule** every frame for one specific display refresh and commit its `IOSurface` as layer
    contents for that refresh.
 
@@ -88,14 +89,14 @@ across refreshes; a 30 fps source reads about 30 and under 15 %.
 | Interpolation, 1280×720 | 6–9 ms per frame |
 | Interpolation, 1920×1080 | about 100 ms: not usable. Sizes in between are rejected |
 | Upscale 720p → 1080p | 4–6 ms per frame |
-| Delay behind the source window | 50 ms (three refreshes); 33 ms with `--no-upscale` |
+| Delay behind the source window | 50 ms (three refreshes); 33 ms with `--low-latency` |
 | On-screen output | 56–60 changes per second |
 
 Two refreshes is the floor for this design on a 60 Hz display: the middle frame needs the next
 source frame and must be shown one refresh before it, and the compositor takes its snapshot about
 10 ms before each refresh, so a frame captured in one refresh cannot make the next. Upscaling adds
 4–6 ms before the middle frame is ready, which pushes it past that snapshot and costs a third
-refresh. For the lowest delay run `./smooth-anything --no-upscale --cushion 0`.
+refresh. For the lowest delay run `./smooth-anything --low-latency`.
 
 When the source itself falls below 30 fps there is nothing to show for the missing refreshes, and
 they appear as short holds.

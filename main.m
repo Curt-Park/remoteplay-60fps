@@ -8,6 +8,14 @@
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 
+// The interpolator accepts 1280x720 and 1920x1080 only, and 1080p takes about 100 ms on an M1.
+static const NSInteger kProcessWidth = 1280, kProcessHeight = 720;
+// Seconds before a refresh by which a frame must be committed to make it. Measured: 12.5 ms ahead always
+// made the refresh, 11 ms ahead often did not.
+static const double kCommitLead = 0.013;
+// A capture whose difference is below this fraction of the last real frame's difference is a repeat.
+static const double kRepeatRatio = 0.3;
+
 static double HostNow(void) { return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock())); }
 static CMTime HostTime(double seconds) { return CMTimeMakeWithSeconds(seconds, 1000000000); }
 static NSString *FourCC(OSType code) {
@@ -44,17 +52,12 @@ static NSString *FourCC(OSType code) {
 
 @interface Smoother : NSObject <SCStreamOutput, SCStreamDelegate, SCContentSharingPickerObserver, NSWindowDelegate>
 @property NSString *match;        // nil = ask with the system window picker
-@property NSInteger targetHeight;
-@property NSInteger targetWidth;   // 0 = follow the window's aspect ratio
 @property BOOL passthrough;
-@property BOOL startFullScreen;
 @property BOOL logStalls;         // print gaps of 0.12-3 s in source frames and in shown frames
 @property double cropTop;         // points cut from the top of the captured window; negative = automatic
-@property double dupThreshold;
 @property BOOL debugDiff;
 @property NSInteger cushion;   // extra refreshes of delay allowed for absorbing uneven frame arrival
 @property BOOL steady;         // keep the extra refresh once it is in use instead of giving it back
-@property double minLead;      // seconds before a refresh by which a frame must be committed to make it
 @property BOOL upscale;   // super-resolve every shown frame 1.5x after interpolation
 @property NSPanel *panel;
 @end
@@ -229,8 +232,7 @@ static NSString *FourCC(OSType code) {
 
 - (void)captureWithFilter:(SCContentFilter *)filter frame:(CGRect)frame {
     // Fixed 16:9 because the interpolator rejects some odd sizes; other window shapes get letterboxed.
-    NSInteger height = self.targetHeight & ~1;
-    NSInteger width = (self.targetWidth > 0 ? self.targetWidth : height * 16 / 9) & ~1;
+    NSInteger width = kProcessWidth, height = kProcessHeight;
     fprintf(stderr, "Source %.0fx%.0f pt -> processing at %ldx%ld\n", frame.size.width, frame.size.height, (long)width, (long)height);
 
     OSType pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
@@ -483,7 +485,6 @@ static NSString *FourCC(OSType code) {
     [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
 
     [self.panel orderFrontRegardless];
-    if (self.startFullScreen) [self toggleFullScreen];
 }
 
 // Full screen here is a borderless panel over the whole screen above the menu bar, not a macOS full-screen
@@ -563,7 +564,7 @@ static NSString *FourCC(OSType code) {
     double now = HostNow();
     if (now - _lastNewTime > 0.15) _lastNewMean = 0;
     BOOL refinement = NO;
-    if (_repeatsInRow == 0) refinement = mean < self.dupThreshold * _lastNewMean;
+    if (_repeatsInRow == 0) refinement = mean < kRepeatRatio * _lastNewMean;
     else if (_repeatsInRow == 1) refinement = mean < MAX(2.5 * _lastRepeatMean, 0.08 * _lastNewMean);
     BOOL duplicate = comparable && (identical || refinement);
     _repeatsInRow = duplicate ? _repeatsInRow + 1 : 0;
@@ -584,7 +585,7 @@ static NSString *FourCC(OSType code) {
     @synchronized (_pending) {
         if (target > _slotVsync + _period / 2) { [_pending addObject:item]; return; }
         // The callback for this frame's refresh already ran; there is still time to commit for it directly.
-        BOOL inTime = !_slotFilled && target > _slotVsync - _period / 2 && _slotVsync - HostNow() > self.minLead - 0.001;
+        BOOL inTime = !_slotFilled && target > _slotVsync - _period / 2 && _slotVsync - HostNow() > kCommitLead - 0.001;
         if (!inTime) { _missed++; return; }
         _slotFilled = YES;
         _shown++;
@@ -703,11 +704,11 @@ static NSString *FourCC(OSType code) {
         // beyond that the middle frame is skipped to catch up. (Filling long gaps with frames at 1/3 and 2/3 was
         // tried: that interpolator mode takes about 35 ms here and stalls more than it saves.)
         double afterPrevious = _lastTarget + period;
-        double first = MAX(afterPrevious, refreshAtOrAfter(HostNow() + self.minLead));
+        double first = MAX(afterPrevious, refreshAtOrAfter(HostNow() + kCommitLead));
         if (middleOut) {
             BOOL behind = first > sourceRefresh + (1 + self.cushion) * period + period / 2;
             // A spare refresh of delay that has gone unused for 3 s is given back.
-            BOOL spare = first > refreshAtOrAfter(HostNow() + self.minLead + 0.003) + period / 2;
+            BOOL spare = first > refreshAtOrAfter(HostNow() + kCommitLead + 0.003) + period / 2;
             _spareStreak = spare ? _spareStreak + 1 : 0;
             BOOL giveBack = !self.steady && _spareStreak >= 90;
             if (behind || giveBack) {
@@ -732,7 +733,7 @@ static NSString *FourCC(OSType code) {
             if (untilComposite < 0.008) usleep((useconds_t)((untilComposite + 0.002) * 1e6));
         }
         CVPixelBufferRef frameOut = [self upscaled:frame];   // off the critical path: the middle frame is already on its way
-        first = MAX(first, refreshAtOrAfter(HostNow() + self.minLead));
+        first = MAX(first, refreshAtOrAfter(HostNow() + kCommitLead));
         [self show:frameOut target:first];
         CVPixelBufferRelease(frameOut);
         _lastTarget = first;
@@ -777,30 +778,25 @@ static NSString *FourCC(OSType code) {
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         Smoother *smoother = [Smoother new];
-        smoother.targetHeight = 720;
-        smoother.dupThreshold = 0.3;
-        smoother.minLead = 0.013;   // measured: commits 12.5 ms ahead always made their refresh, 11 ms ahead often did not
+        // Default: sharpest picture and steadiest pacing (1080p, one spare refresh kept, 50 ms behind the source).
+        smoother.upscale = YES;
+        smoother.steady = YES;
         smoother.cushion = 1;
         smoother.cropTop = -1;
         smoother.logStalls = YES;
-        smoother.upscale = YES;
         double seconds = 0;
         for (int i = 1; i < argc; i++) {
             NSString *flag = @(argv[i]);
             NSString *value = i + 1 < argc ? @(argv[i + 1]) : nil;
-            if ([flag isEqual:@"--passthrough"]) smoother.passthrough = YES;
-            else if ([flag isEqual:@"--fullscreen"]) smoother.startFullScreen = YES;
-            else if ([flag isEqual:@"--no-stalls"]) smoother.logStalls = NO;
-            else if ([flag isEqual:@"--debug-diff"]) smoother.debugDiff = YES;
-            else if ([flag isEqual:@"--no-upscale"]) smoother.upscale = NO;
-            else if ([flag isEqual:@"--match"] && value) { smoother.match = value; i++; }
-            else if ([flag isEqual:@"--height"] && value) { smoother.targetHeight = value.integerValue; i++; }
-            else if ([flag isEqual:@"--width"] && value) { smoother.targetWidth = value.integerValue; i++; }
-            else if ([flag isEqual:@"--steady"]) smoother.steady = YES;
+            if ([flag isEqual:@"--match"] && value) { smoother.match = value; i++; }
+            // 720p; the spare refresh is given back whenever the source is steady (33-50 ms).
+            else if ([flag isEqual:@"--no-upscale"]) { smoother.upscale = NO; smoother.steady = NO; }
+            // 720p and no spare refresh at all: always 33 ms, at the price of a hold whenever a source frame is late.
+            else if ([flag isEqual:@"--low-latency"]) { smoother.upscale = NO; smoother.steady = NO; smoother.cushion = 0; }
             else if ([flag isEqual:@"--crop-top"] && value) { smoother.cropTop = value.doubleValue; i++; }
-            else if ([flag isEqual:@"--cushion"] && value) { smoother.cushion = value.integerValue; i++; }
-            else if ([flag isEqual:@"--min-lead-ms"] && value) { smoother.minLead = value.doubleValue / 1000; i++; }
-            else if ([flag isEqual:@"--dup-thresh"] && value) { smoother.dupThreshold = value.doubleValue; i++; }
+            else if ([flag isEqual:@"--no-stalls"]) smoother.logStalls = NO;
+            else if ([flag isEqual:@"--passthrough"]) smoother.passthrough = YES;
+            else if ([flag isEqual:@"--debug-diff"]) smoother.debugDiff = YES;
             else if ([flag isEqual:@"--seconds"] && value) { seconds = value.doubleValue; i++; }
             else { fprintf(stderr, "Unknown or incomplete option: %s\n", argv[i]); return 2; }
         }
