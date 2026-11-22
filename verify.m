@@ -30,7 +30,8 @@
         SCWindow *best = nil;
         for (SCWindow *window in content.windows) {
             SCRunningApplication *app = window.owningApplication;
-            NSString *haystack = [NSString stringWithFormat:@"%@ %@", app.applicationName, app.bundleIdentifier];
+            // "pid:<n>" can be matched too, to tell apart two instances of the same app.
+            NSString *haystack = [NSString stringWithFormat:@"%@ %@ pid:%d", app.applicationName, app.bundleIdentifier, app.processID];
             if ([haystack rangeOfString:self.match options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
             if (window.frame.size.width < 200 || window.frame.size.height < 150) continue;
             if (!best || window.frame.size.width * window.frame.size.height > best.frame.size.width * best.frame.size.height) best = window;

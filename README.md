@@ -64,6 +64,8 @@ window at the display rate and reports how often the picture really changes:
 ./verify --match com.playstation.RemotePlay
 ```
 
+`--match pid:<n>` selects one process when two instances of an app are running.
+
 A true 60 fps source reads about 57–60 changes per second with 90–100 % of the motion split evenly
 across refreshes; a 30 fps source reads about 30 and under 15 %.
 
@@ -112,6 +114,14 @@ they appear as short holds.
 - GPU work running across the compositor's snapshot point makes it miss refreshes, so the second
   upscale of each pair waits until that point has passed.
 - The interpolator's 1/3–2/3 mode takes about 35 ms here, too slow to fill long gaps.
+- Ways to make the picture look higher-resolution that were tried and dropped (M1):
+  - A second upscale with MetalFX, 1080p → 1440p: about 5–6 ms more per frame, which no longer fits. Output
+    fell to 25–45 fps and the delay grew to 65–160 ms.
+  - A Core Image sharpening filter on the output layer: the compositor then showed 24–29 fps.
+  - A cheap halo-free luma sharpening pass (about 2 ms, pacing unaffected): the difference was barely visible.
+  - Capturing at 1080p and showing real frames untouched, with only middle frames going through 720p: pacing
+    held, but on the same frame native 1080p looked no sharper than 720p plus super resolution. The detail
+    limit is the video stream itself, not the 720p processing size.
 - A window completely covered by an opaque window is treated as hidden, and its captures then arrive in
   bursts about 100 ms apart. The full-screen panel is therefore 0.999 opaque; marking it non-opaque
   without real translucency was not enough.
