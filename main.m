@@ -110,6 +110,9 @@ static NSString *FourCC(OSType code) {
     BOOL _sceneCut;
     int _cuts;
     CGWindowID _pickedWindowID;
+    SCContentFilter *_fixedFilter;   // set when the picked content cannot be found again by app name
+    BOOL _everCaptured;
+    SCStream *_queueStream;          // capture queue only: the stream whose frames are accepted
     double _lastUniqueArrival, _lastPresent;
     OSType _processorFormat;
     SCContentFilter *_filter;
@@ -150,15 +153,18 @@ static NSString *FourCC(OSType code) {
     SCWindow *window = filter.includedWindows.firstObject;
     picker.active = NO;
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!window) {
-            // Without the window's identity the app cannot be followed if it replaces the window.
+        SCRunningApplication *app = window.owningApplication;
+        NSString *name = app.bundleIdentifier.length ? app.bundleIdentifier : app.applicationName;
+        if (!window || !name.length) {
+            // Without the window's identity or an app to search for, the picked content is captured as it is,
+            // and the same filter is retried if the capture stops.
+            self->_fixedFilter = filter;
             [self captureWithFilter:filter frame:filter.contentRect];
             return;
         }
         // The app is remembered as well as the window: when the app replaces its window, its largest one is followed.
         self->_pickedWindowID = window.windowID;
-        self.match = window.owningApplication.bundleIdentifier.length ? window.owningApplication.bundleIdentifier
-                                                                       : window.owningApplication.applicationName;
+        self.match = name;
         [self follow];
     });
 }
@@ -182,6 +188,7 @@ static NSString *FourCC(OSType code) {
 - (void)scan {
     [SCShareableContent getShareableContentExcludingDesktopWindows:YES onScreenWindowsOnly:NO
                                                  completionHandler:^(SCShareableContent *content, NSError *error) {
+        if (!content && self->_everCaptured) return;   // a passing failure mid-session; the next scan tries again
         if (!content) {
             fprintf(stderr, "Cannot list windows: %s\nGrant Screen Recording permission to your terminal in "
                     "System Settings > Privacy & Security, then run again.\n", error.localizedDescription.UTF8String);
@@ -228,6 +235,7 @@ static NSString *FourCC(OSType code) {
     _litArea = CGRectZero;
     [old stopCaptureWithCompletionHandler:^(NSError *error) {}];
     dispatch_sync(_queue, ^{
+        self->_queueStream = nil;
         CVPixelBufferRelease(self->_previousFrame);
         self->_previousFrame = NULL;
         CVPixelBufferRelease(self->_restFrame);
@@ -262,7 +270,7 @@ static NSString *FourCC(OSType code) {
     config.height = height;
     config.pixelFormat = pixelFormat;
     config.minimumFrameInterval = CMTimeMake(1, 240);   // a 1/60 floor rejects refreshes that arrive a hair early (about 2 per second)
-    config.queueDepth = 6;
+    config.queueDepth = 8;   // the maximum: with upscaling and sharpening off, shown frames are capture surfaces held here
     config.showsCursor = NO;
     config.scalesToFit = YES;
     CGFloat cropTop = [self cropTopFor:frame];
@@ -275,16 +283,28 @@ static NSString *FourCC(OSType code) {
 
     SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:self];
     _stream = stream;
+    dispatch_sync(_queue, ^{ self->_queueStream = stream; });
     NSError *error = nil;
     if (![stream addStreamOutput:self type:SCStreamOutputTypeScreen sampleHandlerQueue:_queue error:&error]) {
         fprintf(stderr, "addStreamOutput failed: %s\n", error.localizedDescription.UTF8String);
         exit(1);
     }
     [stream startCaptureWithCompletionHandler:^(NSError *startError) {
-        if (!startError) { fprintf(stderr, "Capturing. Ctrl+C in this terminal to quit.\n"); return; }
+        if (!startError) { self->_everCaptured = YES; fprintf(stderr, "Capturing. Ctrl+C in this terminal to quit.\n"); return; }
         fprintf(stderr, "Capture failed to start (%s); retrying.\n", startError.localizedDescription.UTF8String);
-        dispatch_async(dispatch_get_main_queue(), ^{ if (self->_stream == stream) [self stopCapture]; });
+        dispatch_async(dispatch_get_main_queue(), ^{ [self recoverFrom:stream]; });
     }];
+}
+
+// Main thread. A followed app is found again by the next scan; a fixed filter has no scan, so it is restarted here.
+- (void)recoverFrom:(SCStream *)stream {
+    if (_stream != stream) return;
+    [self stopCapture];
+    SCContentFilter *filter = _fixedFilter;
+    if (!filter) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (!self->_stream) [self captureWithFilter:filter frame:filter.contentRect];
+    });
 }
 
 // A window that does not fill a screen is assumed to have a standard title bar, which is left out.
@@ -321,7 +341,8 @@ static NSString *FourCC(OSType code) {
             CGRect target = CGRectMake(0, top, frame.size.width, frame.size.height - top);
             if (area.size.width >= frame.size.width * 0.4 && fabs(area.size.width / area.size.height - 16.0 / 9.0) <= 0.07) {
                 // The smallest 16:9 rectangle containing the lit area: showing a sliver of border beats cutting picture.
-                CGFloat width = MIN(MAX(area.size.width, area.size.height * 16.0 / 9.0), frame.size.width), height = width * 9.0 / 16.0;
+                CGFloat widest = MIN(frame.size.width, (frame.size.height - top) * 16.0 / 9.0);
+                CGFloat width = MIN(MAX(area.size.width, area.size.height * 16.0 / 9.0), widest), height = width * 9.0 / 16.0;
                 CGFloat x = MIN(MAX(CGRectGetMidX(area) - width / 2, 0), frame.size.width - width);
                 CGFloat y = MAX(MIN(CGRectGetMidY(area) - height / 2, frame.size.height - height), top);
                 target = CGRectMake(x, y, width, height);
@@ -686,7 +707,12 @@ static NSString *FourCC(OSType code) {
 - (void)show:(CVPixelBufferRef)buffer target:(double)target {
     NSArray *item = @[(__bridge id)buffer, @(target)];
     @synchronized (_pending) {
-        if (target > _slotVsync + _period / 2) { [_pending addObject:item]; return; }
+        if (target > _slotVsync + _period / 2) {
+            [_pending addObject:item];
+            // Nothing drains the queue while the display callback is paused (output not on a live display).
+            while (_pending.count > 6) { [_pending removeObjectAtIndex:0]; _missed++; }
+            return;
+        }
         // The callback for this frame's refresh already ran; there is still time to commit for it directly.
         BOOL inTime = !_slotFilled && target > _slotVsync - _period / 2 && _slotVsync - HostNow() > kCommitLead - 0.001;
         if (!inTime) { _missed++; return; }
@@ -711,17 +737,17 @@ static NSString *FourCC(OSType code) {
         _slotFilled = next != nil;
         _slotVsync = target;
     }
-    if (next) {
-        double now = HostNow();
-        if (self.logStalls && _lastPresent > 0 && now - _lastPresent > 0.12 && now - _lastPresent < 3.0) fprintf(stderr, "output: nothing shown for %.0f ms\n", (now - _lastPresent) * 1000);
-        _lastPresent = now;
-        [self present:next];
-    }
+    if (next) [self present:next];
 }
 
 // Main thread. Setting the surface as layer contents commits it for the coming refresh.
 // The array keeps the pixel buffer, and with it the surface, alive while it is on screen.
 - (void)present:(NSArray *)item {
+    double now = HostNow();
+    if (self.logStalls && _lastPresent > 0 && now - _lastPresent > 0.12 && now - _lastPresent < 3.0) {
+        fprintf(stderr, "output: nothing shown for %.0f ms\n", (now - _lastPresent) * 1000);
+    }
+    _lastPresent = now;
     _onScreen = item;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
@@ -779,7 +805,7 @@ static NSString *FourCC(OSType code) {
 }
 
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type {
-    if (type != SCStreamOutputTypeScreen) return;
+    if (type != SCStreamOutputTypeScreen || stream != _queueStream) return;
     NSArray *attachments = (__bridge NSArray *)CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
     NSNumber *status = [attachments.firstObject objectForKey:SCStreamFrameInfoStatus];
     CVPixelBufferRef frame = CMSampleBufferGetImageBuffer(sampleBuffer);
@@ -787,7 +813,7 @@ static NSString *FourCC(OSType code) {
 
     double captureTime = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer));
     double arrival = HostNow();
-    @synchronized (_pending) { if (_slotVsync > 0) { _phaseSum += fmod(arrival - _slotVsync + 10.0, 1.0 / 60.0); _phaseCount++; } }
+    @synchronized (_pending) { if (_slotVsync > 0) { _phaseSum += fmod(arrival - _slotVsync + 10.0, _period); _phaseCount++; } }
     if (_statsStart == 0) _statsStart = arrival;
     _captured++;
     _captureLagSum += arrival - captureTime;
@@ -838,10 +864,12 @@ static NSString *FourCC(OSType code) {
         // out earlier than a commit can still make, and may trail the source by at most `cushion` extra refreshes;
         // beyond that the middle frame is skipped to catch up. (Filling long gaps with frames at 1/3 and 2/3 was
         // tried: that interpolator mode takes about 35 ms here and stalls more than it saves.)
-        double afterPrevious = _lastTarget + period;
+        // Half the source interval in whole refreshes: one refresh at 60 Hz, two at 120 Hz.
+        double step = MAX(1.0, round(_sourceInterval / 2 / period)) * period;
+        double afterPrevious = _lastTarget + step;
         double first = MAX(afterPrevious, refreshAtOrAfter(HostNow() + kCommitLead));
         if (middleOut) {
-            BOOL behind = first > sourceRefresh + (1 + self.cushion) * period + period / 2;
+            BOOL behind = first > sourceRefresh + (1 + self.cushion) * step + period / 2;
             // A spare refresh of delay that has gone unused for 3 s is given back.
             BOOL spare = first > refreshAtOrAfter(HostNow() + kCommitLead + 0.003) + period / 2;
             _spareStreak = spare ? _spareStreak + 1 : 0;
@@ -853,11 +881,11 @@ static NSString *FourCC(OSType code) {
                 _spareStreak = 0;
             }
         }
-        if (_lastTarget > 0 && gap < 0.100 && first > afterPrevious + period / 2) _holds += (int)llround((first - afterPrevious) / period);
+        if (_lastTarget > 0 && gap < 0.100 && first > afterPrevious + period / 2) _holds += (int)llround((first - afterPrevious) / step);
         if (middleOut) {
             [self show:middleOut target:first];
             CVPixelBufferRelease(middleOut);
-            first += period;
+            first += step;
         }
         if (_scaler) {
             // The compositor snapshots the screen at the same point of every refresh, and a captured frame's
@@ -907,7 +935,7 @@ static NSString *FourCC(OSType code) {
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
     fprintf(stderr, "Capture stopped (%s); looking for the window again.\n", error.localizedDescription.UTF8String);
-    dispatch_async(dispatch_get_main_queue(), ^{ if (self->_stream == stream) [self stopCapture]; });
+    dispatch_async(dispatch_get_main_queue(), ^{ [self recoverFrom:stream]; });
 }
 @end
 

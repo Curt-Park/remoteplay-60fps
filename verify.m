@@ -20,13 +20,20 @@
     size_t _sampleCount;
     NSMutableArray<NSNumber *> *_differences;   // one per display refresh, 0 when nothing changed
     double _firstTime;
+    double _rate;   // display refreshes per second
 }
 
 - (void)start {
     _queue = dispatch_queue_create("verify.frames", DISPATCH_QUEUE_SERIAL);
     _differences = [NSMutableArray array];
+    _rate = NSScreen.mainScreen.maximumFramesPerSecond > 0 ? NSScreen.mainScreen.maximumFramesPerSecond : 60;
     [SCShareableContent getShareableContentExcludingDesktopWindows:YES onScreenWindowsOnly:YES
                                                  completionHandler:^(SCShareableContent *content, NSError *error) {
+        if (!content) {
+            fprintf(stderr, "Cannot list windows: %s\nGrant Screen Recording permission to your terminal in "
+                    "System Settings > Privacy & Security, then run again.\n", error.localizedDescription.UTF8String);
+            exit(1);
+        }
         SCWindow *best = nil;
         for (SCWindow *window in content.windows) {
             SCRunningApplication *app = window.owningApplication;
@@ -46,7 +53,11 @@
         config.showsCursor = NO;
         self->_stream = [[SCStream alloc] initWithFilter:[[SCContentFilter alloc] initWithDesktopIndependentWindow:best]
                                            configuration:config delegate:self];
-        [self->_stream addStreamOutput:self type:SCStreamOutputTypeScreen sampleHandlerQueue:self->_queue error:nil];
+        NSError *outputError = nil;
+        if (![self->_stream addStreamOutput:self type:SCStreamOutputTypeScreen sampleHandlerQueue:self->_queue error:&outputError]) {
+            fprintf(stderr, "Cannot attach to the capture: %s\n", outputError.localizedDescription.UTF8String);
+            exit(1);
+        }
         [self->_stream startCaptureWithCompletionHandler:^(NSError *startError) {
             if (startError) { fprintf(stderr, "Capture failed: %s\n", startError.localizedDescription.UTF8String); exit(1); }
         }];
@@ -60,7 +71,7 @@
     double time = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer));
     if (_firstTime == 0) _firstTime = time;
     // One slot per display refresh, placed by the frame's own display timestamp; the first second is warm-up.
-    NSInteger slot = (NSInteger)llround((time - _firstTime - 1.0) * 60.0);
+    NSInteger slot = (NSInteger)llround((time - _firstTime - 1.0) * _rate);
     while (slot >= 0 && (NSInteger)_differences.count <= slot && _differences.count < 3600) [_differences addObject:@0];
     CVPixelBufferRef buffer = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!buffer || status != SCFrameStatusComplete) return;
@@ -101,10 +112,10 @@
         pairs++;
         if (smaller >= 0.4 * larger) evenPairs++;
     }
-    double duration = refreshes / 60.0;
+    double duration = refreshes / _rate;
     printf("%s: measured %.1f s at the display rate\n", self.match.UTF8String, duration);
     printf("  refreshes showing new motion: %.1f per second\n", moved / duration);
-    printf("  motion split evenly across both refreshes of a 1/30 s pair: %.0f%% of pairs\n", pairs ? 100.0 * evenPairs / pairs : 0);
+    printf("  motion split evenly across both refreshes of a pair: %.0f%% of pairs\n", pairs ? 100.0 * evenPairs / pairs : 0);
     printf("  first 40 refresh differences:");
     for (NSUInteger i = 0; i < 40 && i < refreshes; i++) printf(" %.1f", _differences[i].doubleValue);
     printf("\n");
