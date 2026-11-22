@@ -112,6 +112,9 @@ they appear as short holds.
 - GPU work running across the compositor's snapshot point makes it miss refreshes, so the second
   upscale of each pair waits until that point has passed.
 - The interpolator's 1/3–2/3 mode takes about 35 ms here, too slow to fill long gaps.
+- A window completely covered by an opaque window is treated as hidden, and its captures then arrive in
+  bursts about 100 ms apart. The full-screen panel is therefore 0.999 opaque; marking it non-opaque
+  without real translucency was not enough.
 
 ## License
 

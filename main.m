@@ -93,7 +93,10 @@ static NSString *FourCC(OSType code) {
     int _scaled;
     CGWindowID _currentWindowID;
     BOOL _waitingReported;
-    int _repeatsInRow;
+    int _repeatsInRow, _restShown;
+    NSUInteger _captureGeneration;
+    CVPixelBufferRef _restFrame;
+    double _restTime;
     double _lastNewMean, _lastRepeatMean, _lastNewTime;
     double _motionLevel;   // smoothed frame-to-frame difference of recent new frames
     BOOL _sceneCut;
@@ -219,6 +222,9 @@ static NSString *FourCC(OSType code) {
     dispatch_sync(_queue, ^{
         CVPixelBufferRelease(self->_previousFrame);
         self->_previousFrame = NULL;
+        CVPixelBufferRelease(self->_restFrame);
+        self->_restFrame = NULL;
+        self->_captureGeneration++;
         self->_failed = 0;
     });
 }
@@ -485,6 +491,7 @@ static NSString *FourCC(OSType code) {
     [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
 
     [self.panel orderFrontRegardless];
+    if (getenv("SMOOTH_FULLSCREEN")) [self toggleFullScreen];   // for automated tests; users double-click or press F
 }
 
 // Full screen here is a borderless panel over the whole screen above the menu bar, not a macOS full-screen
@@ -498,10 +505,13 @@ static NSString *FourCC(OSType code) {
         if (!_fullPanel) {
             _fullPanel = [[OutputPanel alloc] initWithContentRect:screen.frame styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
                                                           backing:NSBackingStoreBuffered defer:NO];
-            // Declared non-opaque although the black view fills it: a window hidden behind an opaque one counts as
-            // occluded, and an occluded app that is also silent (a menu screen) gets its drawing throttled by macOS.
+            // Very slightly translucent on purpose. Behind a fully opaque panel the captured window counts as
+            // hidden and its captures arrive in bursts about 100 ms apart, which shows as freezes around still
+            // pictures such as menus (measured: ~100 delivery gaps over 40 ms in 16 s opaque, 1-3 at 0.999).
+            // Marking the panel non-opaque without real translucency was not enough.
             _fullPanel.opaque = NO;
             _fullPanel.backgroundColor = NSColor.clearColor;
+            _fullPanel.alphaValue = 0.999;
             _fullPanel.level = NSScreenSaverWindowLevel;
             _fullPanel.hidesOnDeactivate = NO;
             _fullPanel.hasShadow = NO;
@@ -656,6 +666,25 @@ static NSString *FourCC(OSType code) {
     return buffers;
 }
 
+// Capture queue. Shows the last capture, which had been dropped as a repeat, now that the picture has come to rest.
+- (void)showRestFrame {
+    if (!_restFrame) return;
+    double period, grid;
+    @synchronized (_pending) { period = _period; grid = _slotVsync; }
+    CVPixelBufferRef frameOut = [self upscaled:_restFrame];
+    double earliest = grid + ceil((HostNow() + kCommitLead - grid) / period - 1e-6) * period;
+    double target = MAX(_lastTarget + period, earliest);
+    [self show:frameOut target:target];
+    CVPixelBufferRelease(frameOut);
+    _lastTarget = target;
+    _restShown++;
+    // It is now the picture on screen, so the next middle frame starts from it.
+    CVPixelBufferRelease(_previousFrame);
+    _previousFrame = _restFrame;
+    _previousTime = _restTime;
+    _restFrame = NULL;
+}
+
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type {
     if (type != SCStreamOutputTypeScreen) return;
     NSArray *attachments = (__bridge NSArray *)CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
@@ -670,8 +699,21 @@ static NSString *FourCC(OSType code) {
     _captured++;
     _captureLagSum += arrival - captureTime;
 
+    // A capture dropped as a repeat is kept until the next capture arrives. When the picture comes to rest (a
+    // menu opening, a fade ending) its last captures are faint next to the transition before them and are all
+    // dropped as repeats, and since nothing changes afterwards no later frame would ever replace them: the
+    // output would stay on a slightly earlier picture. If no capture follows within 60 ms, the kept one is shown.
+    NSUInteger generation = ++_captureGeneration;
+    CVPixelBufferRelease(_restFrame);
+    _restFrame = NULL;
+
     if ([self isDuplicate:frame]) {
         _duplicates++;
+        _restFrame = CVPixelBufferRetain(frame);
+        _restTime = captureTime;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)), _queue, ^{
+            if (self->_captureGeneration == generation) [self showRestFrame];
+        });
     } else {
         _unique++;
         // Gaps of several seconds are a paused or static screen, not a stall.
@@ -758,8 +800,9 @@ static NSString *FourCC(OSType code) {
                 _interpolated ? _interpSum / _interpolated * 1000 : 0, _interpMax * 1000,
                 _scaled ? _scaleSum / _scaled * 1000 : 0,
                 _behindCount ? _behindSum / _behindCount * 1000 : 0);
-        if (self.debugDiff || getenv("SMOOTH_DEBUG")) fprintf(stderr, "sched: late commits %d, skipped middles %d, missed %d, frame arrives %.1f ms after refresh\n",
-                caught, _trims, missed, phase * 1000);
+        if (self.debugDiff || getenv("SMOOTH_DEBUG")) fprintf(stderr, "sched: late commits %d, skipped middles %d, missed %d, rest frames %d, frame arrives %.1f ms after refresh\n",
+                caught, _trims, missed, _restShown, phase * 1000);
+        _restShown = 0;
         _holds = _trims = _behindCount = 0;
         _behindSum = 0;
         _statsStart = arrival;
