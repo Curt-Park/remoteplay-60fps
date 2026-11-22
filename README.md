@@ -11,7 +11,8 @@ file, no dependencies.
 
 ## Requirements
 
-- Apple silicon Mac, macOS 26 or later
+- Apple silicon Mac, macOS 27 or later (on macOS 26 super resolution rejects 1280×720 frames, so
+  there is no 1080p output)
 - Xcode command line tools
 - Screen Recording permission for the terminal you run it from
   (System Settings → Privacy & Security → Screen & System Audio Recording)

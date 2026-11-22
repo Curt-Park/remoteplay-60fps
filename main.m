@@ -396,12 +396,12 @@ static NSString *FourCC(OSType code) {
         fprintf(stderr, "Low-latency frame interpolation is not supported on this Mac.\n");
         exit(1);
     }
-    if (@available(macOS 27.0, *)) {
-        NSInteger maxPixels = [VTLowLatencyFrameInterpolationConfiguration maximumPixelCountForSpatialScaleFactor:1];
-        NSInteger maxDimension = [VTLowLatencyFrameInterpolationConfiguration maximumDimensionForSpatialScaleFactor:1];
-        fprintf(stderr, "Interpolator limits: %ld pixels, %ld max dimension (request is %ld pixels)\n",
-                (long)maxPixels, (long)maxDimension, (long)(width * height));
-    }
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 270000   // these are declared from the macOS 27 SDK on
+    NSInteger maxPixels = [VTLowLatencyFrameInterpolationConfiguration maximumPixelCountForSpatialScaleFactor:1];
+    NSInteger maxDimension = [VTLowLatencyFrameInterpolationConfiguration maximumDimensionForSpatialScaleFactor:1];
+    fprintf(stderr, "Interpolator limits: %ld pixels, %ld max dimension (request is %ld pixels)\n",
+            (long)maxPixels, (long)maxDimension, (long)(width * height));
+#endif
     VTLowLatencyFrameInterpolationConfiguration *config =
         [[VTLowLatencyFrameInterpolationConfiguration alloc] initWithFrameWidth:width frameHeight:height numberOfInterpolatedFrames:1];
     if (!config) {
