@@ -1,6 +1,6 @@
-// smooth-anything: captures one window (PS Remote Play by default), interpolates 30 fps -> 60 fps
-// with VideoToolbox low-latency frame interpolation, and shows the result in an overlay over the
-// captured window or next to it. Apple frameworks only. See README.md for options.
+// smooth-anything: captures one window (picked with the mouse, or named with --match), interpolates
+// 30 fps -> 60 fps with VideoToolbox low-latency frame interpolation, and shows the result in its own
+// window. Apple frameworks only. See README.md for options.
 
 #import <Cocoa/Cocoa.h>
 #import <AVFoundation/AVFoundation.h>
@@ -15,19 +15,47 @@ static NSString *FourCC(OSType code) {
     return [NSString stringWithUTF8String:chars];
 }
 
-@interface Smoother : NSObject <SCStreamOutput, SCStreamDelegate>
-@property NSString *match;
+// Content view of the output window. Double-click, or F / Esc while the window has the keyboard, toggles full screen.
+@interface OutputView : NSView
+@property (copy) void (^toggleFullScreen)(void);
+@property (copy) BOOL (^isFullScreen)(void);
+@end
+
+@implementation OutputView
+- (BOOL)acceptsFirstResponder { return YES; }
+- (BOOL)mouseDownCanMoveWindow { return YES; }
+- (void)mouseDown:(NSEvent *)event {
+    if (event.clickCount == 2) self.toggleFullScreen(); else [super mouseDown:event];
+}
+- (void)keyDown:(NSEvent *)event {
+    BOOL escape = event.keyCode == 53, letterF = [event.charactersIgnoringModifiers.lowercaseString isEqual:@"f"];
+    if (letterF || (escape && self.isFullScreen())) self.toggleFullScreen(); else [super keyDown:event];
+}
+@end
+
+// A panel that takes the keyboard without activating this app, so the captured app stays frontmost
+// and keeps receiving controller input while the output window is used.
+@interface OutputPanel : NSPanel
+@end
+
+@implementation OutputPanel
+- (BOOL)canBecomeKeyWindow { return YES; }
+@end
+
+@interface Smoother : NSObject <SCStreamOutput, SCStreamDelegate, SCContentSharingPickerObserver, NSWindowDelegate>
+@property NSString *match;        // nil = ask with the system window picker
 @property NSInteger targetHeight;
 @property NSInteger targetWidth;   // 0 = follow the window's aspect ratio
 @property BOOL passthrough;
-@property BOOL sideBySide;   // show the result next to the captured window instead of over it
+@property BOOL startFullScreen;
+@property BOOL logStalls;         // print gaps of 0.12-3 s in source frames and in shown frames
+@property double cropTop;         // points cut from the top of the captured window; negative = automatic
 @property double dupThreshold;
 @property BOOL debugDiff;
 @property NSInteger cushion;   // extra refreshes of delay allowed for absorbing uneven frame arrival
 @property BOOL steady;         // keep the extra refresh once it is in use instead of giving it back
 @property double minLead;      // seconds before a refresh by which a frame must be committed to make it
 @property BOOL upscale;   // super-resolve every shown frame 1.5x after interpolation
-@property pid_t targetPid;
 @property NSPanel *panel;
 @end
 
@@ -61,14 +89,22 @@ static NSString *FourCC(OSType code) {
     double _interpSum, _interpMax, _captureLagSum, _scaleSum;
     int _scaled;
     CGWindowID _currentWindowID;
-    CGRect _currentFrame;
     BOOL _waitingReported;
     int _repeatsInRow;
-    double _lastNewMean;
+    double _lastNewMean, _lastRepeatMean;
     double _motionLevel;   // smoothed frame-to-frame difference of recent new frames
     BOOL _sceneCut;
     int _cuts;
-    id _activationObserver;
+    CGWindowID _pickedWindowID;
+    double _lastUniqueArrival, _lastPresent;
+    OSType _processorFormat;
+    SCContentFilter *_filter;
+    SCStreamConfiguration *_config;
+    CGRect _sourceFrame;     // captured window, points
+    BOOL _contentFound;      // the picture area inside the window has been located
+    NSPanel *_fullPanel;
+    CGSize _currentSize;
+    BOOL _fullScreen;
 }
 
 - (instancetype)init {
@@ -81,6 +117,49 @@ static NSString *FourCC(OSType code) {
 }
 
 - (void)start {
+    [self makeOutputWindow];
+    if (self.match) { [self follow]; return; }
+    SCContentSharingPickerConfiguration *configuration = [SCContentSharingPickerConfiguration new];
+    configuration.allowedPickerModes = SCContentSharingPickerModeSingleWindow;
+    configuration.excludedBundleIDs = @[];
+    configuration.excludedWindowIDs = @[@(self.panel.windowNumber)];
+    SCContentSharingPicker *picker = SCContentSharingPicker.sharedPicker;
+    picker.defaultConfiguration = configuration;
+    [picker addObserver:self];
+    picker.active = YES;
+    fprintf(stderr, "Click the window to smooth.\n");
+    [NSApp activateIgnoringOtherApps:YES];
+    [picker presentPickerUsingContentStyle:SCShareableContentStyleWindow];
+}
+
+- (void)contentSharingPicker:(SCContentSharingPicker *)picker didUpdateWithFilter:(SCContentFilter *)filter forStream:(SCStream *)stream {
+    SCWindow *window = filter.includedWindows.firstObject;
+    picker.active = NO;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!window) {
+            // Without the window's identity the app cannot be followed if it replaces the window.
+            [self captureWithFilter:filter frame:filter.contentRect];
+            return;
+        }
+        // The app is remembered as well as the window: when the app replaces its window, its largest one is followed.
+        self->_pickedWindowID = window.windowID;
+        self.match = window.owningApplication.bundleIdentifier.length ? window.owningApplication.bundleIdentifier
+                                                                       : window.owningApplication.applicationName;
+        [self follow];
+    });
+}
+
+- (void)contentSharingPicker:(SCContentSharingPicker *)picker didCancelForStream:(SCStream *)stream {
+    fprintf(stderr, "No window chosen.\n");
+    exit(0);
+}
+
+- (void)contentSharingPickerStartDidFailWithError:(NSError *)error {
+    fprintf(stderr, "Window picker failed: %s\nPass --match <app name> instead.\n", error.localizedDescription.UTF8String);
+    exit(1);
+}
+
+- (void)follow {
     [self scan];
     [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *timer) { [self scan]; }];
 }
@@ -99,13 +178,15 @@ static NSString *FourCC(OSType code) {
 }
 
 - (void)chooseFrom:(NSArray<SCWindow *> *)windows {
-    SCWindow *best = nil, *current = nil;
+    SCWindow *best = nil, *current = nil, *picked = nil;
     for (SCWindow *window in windows) {
+        if (window.windowID == self.panel.windowNumber) continue;
         SCRunningApplication *app = window.owningApplication;
         NSString *haystack = [NSString stringWithFormat:@"%@ %@", app.applicationName, app.bundleIdentifier];
         if ([haystack rangeOfString:self.match options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
         if (window.frame.size.width < 200 || window.frame.size.height < 150) continue;
         if (window.windowID == _currentWindowID) current = window;
+        if (window.windowID == _pickedWindowID) picked = window;
         CGFloat area = window.frame.size.width * window.frame.size.height;
         CGFloat bestArea = best.frame.size.width * best.frame.size.height;
         if (!best || (window.onScreen && !best.onScreen) || (window.onScreen == best.onScreen && area > bestArea)) best = window;
@@ -118,25 +199,21 @@ static NSString *FourCC(OSType code) {
     _waitingReported = NO;
     // While the app sits in another Space nothing is on screen; stay on the window already captured.
     if (current && !best.onScreen) best = current;
-    if (best.windowID == _currentWindowID && CGRectEqualToRect(best.frame, _currentFrame)) return;
+    if (picked) best = picked;
+    if (best.windowID == _currentWindowID && CGSizeEqualToSize(best.frame.size, _currentSize)) { [self findContent]; return; }
     [self stopCapture];
     [self captureWindow:best];
 }
 
+// The interpolator and scaler sessions are kept: they do not depend on the window and take about a second to start.
 - (void)stopCapture {
     SCStream *old = _stream;
     _stream = nil;
+    _filter = nil;
     _currentWindowID = 0;
+    _contentFound = NO;
     [old stopCaptureWithCompletionHandler:^(NSError *error) {}];
     dispatch_sync(_queue, ^{
-        [self->_processor endSession];
-        self->_processor = nil;
-        CVPixelBufferPoolRelease(self->_pool);
-        self->_pool = NULL;
-        [self->_scaler endSession];
-        self->_scaler = nil;
-        CVPixelBufferPoolRelease(self->_scaledPool);
-        self->_scaledPool = NULL;
         CVPixelBufferRelease(self->_previousFrame);
         self->_previousFrame = NULL;
         self->_failed = 0;
@@ -144,25 +221,25 @@ static NSString *FourCC(OSType code) {
 }
 
 - (void)captureWindow:(SCWindow *)window {
-    CGRect frame = window.frame;
+    _currentWindowID = window.windowID;
+    _currentSize = window.frame.size;
+    fprintf(stderr, "Window: \"%s\" of %s\n", window.title.UTF8String, window.owningApplication.applicationName.UTF8String);
+    [self captureWithFilter:[[SCContentFilter alloc] initWithDesktopIndependentWindow:window] frame:window.frame];
+}
+
+- (void)captureWithFilter:(SCContentFilter *)filter frame:(CGRect)frame {
     // Fixed 16:9 because the interpolator rejects some odd sizes; other window shapes get letterboxed.
     NSInteger height = self.targetHeight & ~1;
     NSInteger width = (self.targetWidth > 0 ? self.targetWidth : height * 16 / 9) & ~1;
-    self.targetPid = window.owningApplication.processID;
-    _currentWindowID = window.windowID;
-    _currentFrame = frame;
-    fprintf(stderr, "Window: \"%s\" of %s, %.0fx%.0f pt -> processing at %ldx%ld\n", window.title.UTF8String,
-            window.owningApplication.applicationName.UTF8String, frame.size.width, frame.size.height, (long)width, (long)height);
+    fprintf(stderr, "Source %.0fx%.0f pt -> processing at %ldx%ld\n", frame.size.width, frame.size.height, (long)width, (long)height);
 
     OSType pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     if (!self.passthrough) {
         __block OSType chosen = 0;
-        dispatch_sync(_queue, ^{ chosen = [self startInterpolatorWidth:width height:height]; });
-        if (chosen) pixelFormat = chosen;
+        dispatch_sync(_queue, ^{ chosen = self->_processor ? self->_processorFormat : [self startInterpolatorWidth:width height:height]; });
+        if (chosen) { pixelFormat = chosen; _processorFormat = chosen; }
     }
-    if (self.upscale) dispatch_sync(_queue, ^{ [self startScalerWidth:width height:height format:pixelFormat]; });
-
-    [self makeOverlayFor:frame];
+    if (self.upscale) dispatch_sync(_queue, ^{ if (!self->_scaler) [self startScalerWidth:width height:height format:pixelFormat]; });
 
     SCStreamConfiguration *config = [SCStreamConfiguration new];
     config.width = width;
@@ -172,10 +249,14 @@ static NSString *FourCC(OSType code) {
     config.queueDepth = 6;
     config.showsCursor = NO;
     config.scalesToFit = YES;
+    CGFloat cropTop = [self cropTopFor:frame];
+    if (cropTop > 0) config.sourceRect = CGRectMake(0, cropTop, frame.size.width, frame.size.height - cropTop);
+    _config = config;
+    _filter = filter;
+    _sourceFrame = frame;
     config.colorSpaceName = kCGColorSpaceSRGB;
     config.colorMatrix = kCGDisplayStreamYCbCrMatrix_ITU_R_709_2;
 
-    SCContentFilter *filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:window];
     SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:self];
     _stream = stream;
     NSError *error = nil;
@@ -188,6 +269,79 @@ static NSString *FourCC(OSType code) {
         fprintf(stderr, "Capture failed to start (%s); retrying.\n", startError.localizedDescription.UTF8String);
         dispatch_async(dispatch_get_main_queue(), ^{ if (self->_stream == stream) [self stopCapture]; });
     }];
+}
+
+// A window that does not fill a screen is assumed to have a standard title bar, which is left out.
+- (CGFloat)cropTopFor:(CGRect)frame {
+    BOOL fillsScreen = NO;
+    for (NSScreen *screen in NSScreen.screens) if (CGSizeEqualToSize(screen.frame.size, frame.size)) fillsScreen = YES;
+    CGFloat cropTop = self.cropTop >= 0 ? self.cropTop : (fillsScreen ? 0 : 28);
+    return cropTop < frame.size.height / 2 ? cropTop : 0;
+}
+
+// A video app letterboxes its 16:9 picture inside a window of another shape. Capturing the whole window
+// would letterbox it again and leave the output with black borders, so the picture area is located in a
+// screenshot and only that area is captured. Dark scenes and non-16:9 results are ignored.
+- (void)findContent {
+    SCContentFilter *filter = _filter;
+    SCStream *stream = _stream;
+    if (!filter || !stream || _contentFound || self.cropTop >= 0) return;
+    CGRect frame = _sourceFrame;
+    SCStreamConfiguration *shot = [SCStreamConfiguration new];
+    shot.width = (size_t)frame.size.width;
+    shot.height = (size_t)frame.size.height;
+    shot.showsCursor = NO;
+    [SCScreenshotManager captureImageWithFilter:filter configuration:shot completionHandler:^(CGImageRef image, NSError *error) {
+        if (!image) return;
+        CGRect content = [self pictureAreaIn:image below:[self cropTopFor:frame]];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (CGRectIsNull(content) || self->_stream != stream) return;
+            self->_contentFound = YES;
+            if (CGRectGetWidth(CGRectIntersection(content, self->_config.sourceRect)) > 0 &&
+                fabs(content.origin.x - self->_config.sourceRect.origin.x) < 2 && fabs(content.origin.y - self->_config.sourceRect.origin.y) < 2 &&
+                fabs(content.size.width - self->_config.sourceRect.size.width) < 2 && fabs(content.size.height - self->_config.sourceRect.size.height) < 2) return;
+            fprintf(stderr, "Picture area %.0fx%.0f at (%.0f, %.0f) in the %.0fx%.0f window\n", content.size.width, content.size.height,
+                    content.origin.x, content.origin.y, frame.size.width, frame.size.height);
+            self->_config.sourceRect = content;
+            [stream updateConfiguration:self->_config completionHandler:^(NSError *updateError) {
+                if (updateError) fprintf(stderr, "Could not crop to the picture area: %s\n", updateError.localizedDescription.UTF8String);
+            }];
+        });
+    }];
+}
+
+// Returns the 16:9 picture area in image coordinates (top-left origin), or CGRectNull when none is evident.
+- (CGRect)pictureAreaIn:(CGImageRef)image below:(CGFloat)top {
+    size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
+    if (width < 64 || height < 64) return CGRectNull;
+    uint8_t *gray = calloc(width * height, 1);
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceGray();
+    CGContextRef context = CGBitmapContextCreate(gray, width, height, 8, width, space, (CGBitmapInfo)kCGImageAlphaNone);
+    CGContextDrawImage(context, CGRectMake(0, 0, width, height), image);
+    CGContextRelease(context);
+    CGColorSpaceRelease(space);
+    BOOL (^rowLit)(size_t, size_t, size_t) = ^BOOL(size_t y, size_t fromX, size_t toX) {
+        size_t lit = 0, samples = 0;
+        for (size_t x = fromX; x < toX; x += 3, samples++) if (gray[y * width + x] > 24) lit++;
+        return lit * 33 >= samples;   // at least 3 % of the row
+    };
+    BOOL (^columnLit)(size_t, size_t, size_t) = ^BOOL(size_t x, size_t fromY, size_t toY) {
+        size_t lit = 0, samples = 0;
+        for (size_t y = fromY; y < toY; y += 3, samples++) if (gray[y * width + x] > 24) lit++;
+        return lit * 33 >= samples;
+    };
+    size_t y0 = (size_t)top, y1 = height;
+    while (y0 < y1 && !rowLit(y0, 0, width)) y0++;
+    while (y1 > y0 && !rowLit(y1 - 1, 0, width)) y1--;
+    size_t x0 = 0, x1 = width;
+    while (x0 < x1 && !columnLit(x0, y0, y1)) x0++;
+    while (x1 > x0 && !columnLit(x1 - 1, y0, y1)) x1--;
+    free(gray);
+    double w = (double)(x1 - x0), h = (double)(y1 - y0);
+    if (w < width * 0.4 || h < 64 || fabs(w / h - 16.0 / 9.0) > 0.07) return CGRectNull;
+    // Snap to exactly 16:9 inside the detected area so the capture fills the processing size with no borders.
+    double snappedW = MIN(w, h * 16.0 / 9.0), snappedH = snappedW * 9.0 / 16.0;
+    return CGRectMake(x0 + (w - snappedW) / 2, y0 + (h - snappedH) / 2, snappedW, snappedH);
 }
 
 - (OSType)startInterpolatorWidth:(NSInteger)width height:(NSInteger)height {
@@ -284,67 +438,77 @@ static NSString *FourCC(OSType code) {
     return destination;
 }
 
-- (void)makeOverlayFor:(CGRect)windowFrame {
-    // SCWindow frames have a top-left origin on the primary display; Cocoa uses bottom-left.
-    CGFloat primaryHeight = NSScreen.screens.firstObject.frame.size.height;
-    NSRect rect = NSMakeRect(windowFrame.origin.x, primaryHeight - windowFrame.origin.y - windowFrame.size.height,
-                             windowFrame.size.width, windowFrame.size.height);
-    if (self.sideBySide) rect = [self rectBeside:rect];
-    if (self.panel) {
-        [self.panel setFrame:rect display:YES];
-        [self updateOverlayVisibility];
-        return;
-    }
-    self.panel = [[NSPanel alloc] initWithContentRect:rect styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
-                                              backing:NSBackingStoreBuffered defer:NO];
+- (void)makeOutputWindow {
+    NSRect screen = NSScreen.mainScreen.visibleFrame;
+    CGFloat width = MIN(1280, screen.size.width * 0.6), height = width * 9 / 16;
+    NSRect rect = NSMakeRect(NSMaxX(screen) - width - 40, NSMaxY(screen) - height - 60, width, height);
+    self.panel = [[OutputPanel alloc] initWithContentRect:rect
+                                                styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable |
+                                                          NSWindowStyleMaskNonactivatingPanel
+                                                  backing:NSBackingStoreBuffered defer:NO];
+    self.panel.title = @"smooth-anything — double-click for full screen";
     self.panel.backgroundColor = NSColor.blackColor;
-    self.panel.level = self.sideBySide ? NSFloatingWindowLevel : NSScreenSaverWindowLevel;
-    self.panel.ignoresMouseEvents = YES;   // clicks and focus stay with the captured app
+    self.panel.floatingPanel = YES;
     self.panel.hidesOnDeactivate = NO;
+    self.panel.contentAspectRatio = NSMakeSize(16, 9);
+    self.panel.delegate = self;
+    // Stays visible over a captured app that is itself in a full-screen Space.
     self.panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
-    self.panel.contentView.wantsLayer = YES;
+
+    OutputView *view = [[OutputView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
+    __weak Smoother *weakSelf = self;
+    view.toggleFullScreen = ^{ [weakSelf toggleFullScreen]; };
+    view.isFullScreen = ^BOOL { Smoother *me = weakSelf; return me ? me->_fullScreen : NO; };
+    view.wantsLayer = YES;
+    self.panel.contentView = view;
 
     _layer = [CALayer new];
-    _layer.frame = self.panel.contentView.bounds;
+    _layer.frame = view.bounds;
     _layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
     _layer.contentsGravity = kCAGravityResizeAspect;
     _layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
-    [self.panel.contentView.layer addSublayer:_layer];
-    CADisplayLink *link = [self.panel.contentView displayLinkWithTarget:self selector:@selector(refresh:)];
+    [view.layer addSublayer:_layer];
+    CADisplayLink *link = [view displayLinkWithTarget:self selector:@selector(refresh:)];
     [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
 
-    // The overlay is only up while the captured app is frontmost, so other apps stay usable.
-    _activationObserver = [NSWorkspace.sharedWorkspace.notificationCenter
-        addObserverForName:NSWorkspaceDidActivateApplicationNotification object:nil queue:NSOperationQueue.mainQueue
-                usingBlock:^(NSNotification *note) { [self updateOverlayVisibility]; }];
-    [self updateOverlayVisibility];
+    [self.panel orderFrontRegardless];
+    if (self.startFullScreen) [self toggleFullScreen];
 }
 
-// Largest same-shape rectangle that fits in the free space left or right of the window.
-- (NSRect)rectBeside:(NSRect)window {
-    NSScreen *screen = NSScreen.screens.firstObject;
-    for (NSScreen *candidate in NSScreen.screens) {
-        if (NSPointInRect(NSMakePoint(NSMidX(window), NSMidY(window)), candidate.frame)) screen = candidate;
+// Full screen here is a borderless panel over the whole screen above the menu bar, not a macOS full-screen
+// Space: entering a Space would activate this app and take controller input away from the captured one.
+// It is a second panel because a titled window restyled as borderless kept its rounded corners.
+- (void)toggleFullScreen {
+    _fullScreen = !_fullScreen;
+    NSView *view = _fullScreen ? self.panel.contentView : _fullPanel.contentView;
+    if (_fullScreen) {
+        NSScreen *screen = self.panel.screen ?: NSScreen.mainScreen;
+        if (!_fullPanel) {
+            _fullPanel = [[OutputPanel alloc] initWithContentRect:screen.frame styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+                                                          backing:NSBackingStoreBuffered defer:NO];
+            _fullPanel.backgroundColor = NSColor.blackColor;
+            _fullPanel.level = NSScreenSaverWindowLevel;
+            _fullPanel.hidesOnDeactivate = NO;
+            _fullPanel.hasShadow = NO;
+            _fullPanel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
+        }
+        self.panel.contentView = [NSView new];
+        [_fullPanel setFrame:screen.frame display:NO];
+        _fullPanel.contentView = view;
+        [_fullPanel orderFrontRegardless];
+        [self.panel orderOut:nil];
+        [_fullPanel makeFirstResponder:view];
+    } else {
+        _fullPanel.contentView = [NSView new];
+        self.panel.contentView = view;
+        [self.panel orderFrontRegardless];
+        [_fullPanel orderOut:nil];
+        [self.panel makeFirstResponder:view];
     }
-    NSRect visible = screen.visibleFrame;
-    CGFloat rightSpace = NSMaxX(visible) - NSMaxX(window), leftSpace = NSMinX(window) - NSMinX(visible);
-    BOOL onRight = rightSpace >= leftSpace;
-    CGFloat space = MAX(rightSpace, leftSpace);
-    if (space < 200) {
-        fprintf(stderr, "No room beside the window; shrink it to at most half the screen width. Using the screen corner.\n");
-        space = visible.size.width / 3;
-        onRight = YES;
-        window.origin.x = NSMaxX(visible) - space - window.size.width;
-    }
-    CGFloat width = MIN(window.size.width, space), height = width * window.size.height / window.size.width;
-    CGFloat x = onRight ? NSMaxX(window) : NSMinX(window) - width;
-    return NSMakeRect(x, NSMaxY(window) - height, width, height);
 }
 
-- (void)updateOverlayVisibility {
-    if (self.sideBySide) { [self.panel orderFrontRegardless]; return; }
-    if (NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier == self.targetPid) [self.panel orderFrontRegardless];
-    else [self.panel orderOut:nil];
+- (void)windowWillClose:(NSNotification *)notification {
+    exit(0);
 }
 
 // Remote Play repeats each 30 fps game frame; repeats must not reach the interpolator.
@@ -378,10 +542,14 @@ static NSString *FourCC(OSType code) {
     BOOL identical = mean < 0.01 && strong == 0;
     // Delivery jitter can hold one source frame for three refreshes, so two faint repeats in a row are allowed;
     // a third faint frame is taken as real motion that slowed down.
-    BOOL refinement = _repeatsInRow < 2 && mean < self.dupThreshold * _lastNewMean;
+    // A second repeat in a row must also be about as faint as the first; otherwise real motion that has just slowed
+    // sharply (a fast pan coming to rest) would be dropped as two repeats and show as a short freeze.
+    BOOL refinement = NO;
+    if (_repeatsInRow == 0) refinement = mean < self.dupThreshold * _lastNewMean;
+    else if (_repeatsInRow == 1) refinement = mean < MAX(2.5 * _lastRepeatMean, 0.08 * _lastNewMean);
     BOOL duplicate = comparable && (identical || refinement);
     _repeatsInRow = duplicate ? _repeatsInRow + 1 : 0;
-    if (!duplicate) _lastNewMean = mean;
+    if (duplicate) _lastRepeatMean = mean; else _lastNewMean = mean;
     // A cut changes far more of the picture than the motion around it; blending across one smears two scenes together.
     // A false alarm only costs one middle frame, so the bar is low.
     _sceneCut = comparable && !duplicate && mean > 12.0 && mean > 2.5 * _motionLevel;
@@ -421,7 +589,12 @@ static NSString *FourCC(OSType code) {
         _slotFilled = next != nil;
         _slotVsync = target;
     }
-    if (next) [self present:next];
+    if (next) {
+        double now = HostNow();
+        if (self.logStalls && _lastPresent > 0 && now - _lastPresent > 0.12 && now - _lastPresent < 3.0) fprintf(stderr, "output: nothing shown for %.0f ms\n", (now - _lastPresent) * 1000);
+        _lastPresent = now;
+        [self present:next];
+    }
 }
 
 // Main thread. Setting the surface as layer contents commits it for the coming refresh.
@@ -482,6 +655,11 @@ static NSString *FourCC(OSType code) {
         _duplicates++;
     } else {
         _unique++;
+        // Gaps of several seconds are a paused or static screen, not a stall.
+        if (self.logStalls && _lastUniqueArrival > 0 && arrival - _lastUniqueArrival > 0.12 && arrival - _lastUniqueArrival < 3.0) {
+            fprintf(stderr, "source: no new frame for %.0f ms\n", (arrival - _lastUniqueArrival) * 1000);
+        }
+        _lastUniqueArrival = arrival;
         double gap = _previousFrame ? captureTime - _previousTime : 0;
         if (gap > 0.025 && gap < 0.045) _sourceInterval += 0.1 * (gap - _sourceInterval);
         if (_sceneCut) _cuts++;
@@ -581,23 +759,26 @@ static NSString *FourCC(OSType code) {
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         Smoother *smoother = [Smoother new];
-        smoother.match = @"com.playstation.RemotePlay";
         smoother.targetHeight = 720;
         smoother.dupThreshold = 0.3;
         smoother.minLead = 0.013;   // measured: commits 12.5 ms ahead always made their refresh, 11 ms ahead often did not
         smoother.cushion = 1;
+        smoother.cropTop = -1;
+        smoother.logStalls = YES;
         double seconds = 0;
         for (int i = 1; i < argc; i++) {
             NSString *flag = @(argv[i]);
             NSString *value = i + 1 < argc ? @(argv[i + 1]) : nil;
             if ([flag isEqual:@"--passthrough"]) smoother.passthrough = YES;
-            else if ([flag isEqual:@"--side"]) smoother.sideBySide = YES;
+            else if ([flag isEqual:@"--fullscreen"]) smoother.startFullScreen = YES;
+            else if ([flag isEqual:@"--no-stalls"]) smoother.logStalls = NO;
             else if ([flag isEqual:@"--debug-diff"]) smoother.debugDiff = YES;
             else if ([flag isEqual:@"--upscale"]) smoother.upscale = YES;
             else if ([flag isEqual:@"--match"] && value) { smoother.match = value; i++; }
             else if ([flag isEqual:@"--height"] && value) { smoother.targetHeight = value.integerValue; i++; }
             else if ([flag isEqual:@"--width"] && value) { smoother.targetWidth = value.integerValue; i++; }
             else if ([flag isEqual:@"--steady"]) smoother.steady = YES;
+            else if ([flag isEqual:@"--crop-top"] && value) { smoother.cropTop = value.doubleValue; i++; }
             else if ([flag isEqual:@"--cushion"] && value) { smoother.cushion = value.integerValue; i++; }
             else if ([flag isEqual:@"--min-lead-ms"] && value) { smoother.minLead = value.doubleValue / 1000; i++; }
             else if ([flag isEqual:@"--dup-thresh"] && value) { smoother.dupThreshold = value.doubleValue; i++; }
@@ -605,7 +786,11 @@ int main(int argc, const char *argv[]) {
             else { fprintf(stderr, "Unknown or incomplete option: %s\n", argv[i]); return 2; }
         }
         NSApplication *app = NSApplication.sharedApplication;
-        app.activationPolicy = NSApplicationActivationPolicyAccessory;
+        app.activationPolicy = NSApplicationActivationPolicyRegular;
+        NSMenu *bar = [NSMenu new], *menu = [NSMenu new];
+        [menu addItemWithTitle:@"Quit smooth-anything" action:@selector(terminate:) keyEquivalent:@"q"];
+        [[bar addItemWithTitle:@"" action:nil keyEquivalent:@""] setSubmenu:menu];
+        app.mainMenu = bar;
         if (!CGPreflightScreenCaptureAccess()) CGRequestScreenCaptureAccess();
         [smoother start];
         if (seconds > 0) {
