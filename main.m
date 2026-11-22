@@ -91,7 +91,7 @@ static NSString *FourCC(OSType code) {
     CGWindowID _currentWindowID;
     BOOL _waitingReported;
     int _repeatsInRow;
-    double _lastNewMean, _lastRepeatMean;
+    double _lastNewMean, _lastRepeatMean, _lastNewTime;
     double _motionLevel;   // smoothed frame-to-frame difference of recent new frames
     BOOL _sceneCut;
     int _cuts;
@@ -101,7 +101,7 @@ static NSString *FourCC(OSType code) {
     SCContentFilter *_filter;
     SCStreamConfiguration *_config;
     CGRect _sourceFrame;     // captured window, points
-    BOOL _contentFound;      // the picture area inside the window has been located
+    CGRect _litArea;         // everything seen lit in the window so far, points
     NSPanel *_fullPanel;
     CGSize _currentSize;
     BOOL _fullScreen;
@@ -211,7 +211,7 @@ static NSString *FourCC(OSType code) {
     _stream = nil;
     _filter = nil;
     _currentWindowID = 0;
-    _contentFound = NO;
+    _litArea = CGRectZero;
     [old stopCaptureWithCompletionHandler:^(NSError *error) {}];
     dispatch_sync(_queue, ^{
         CVPixelBufferRelease(self->_previousFrame);
@@ -280,38 +280,51 @@ static NSString *FourCC(OSType code) {
 }
 
 // A video app letterboxes its 16:9 picture inside a window of another shape. Capturing the whole window
-// would letterbox it again and leave the output with black borders, so the picture area is located in a
-// screenshot and only that area is captured. Dark scenes and non-16:9 results are ignored.
+// would letterbox it again and leave the output with black borders, so the lit area of the window is
+// measured from a screenshot on every scan and only the 16:9 area around it is captured.
+// The lit area is accumulated and never shrinks: a dark scene with black edges must not be mistaken for
+// borders, which would cut off the sides of the picture for good.
 - (void)findContent {
     SCContentFilter *filter = _filter;
     SCStream *stream = _stream;
-    if (!filter || !stream || _contentFound || self.cropTop >= 0) return;
+    if (!filter || !stream || self.cropTop >= 0) return;
     CGRect frame = _sourceFrame;
+    CGFloat top = [self cropTopFor:frame];
     SCStreamConfiguration *shot = [SCStreamConfiguration new];
     shot.width = (size_t)frame.size.width;
     shot.height = (size_t)frame.size.height;
     shot.showsCursor = NO;
     [SCScreenshotManager captureImageWithFilter:filter configuration:shot completionHandler:^(CGImageRef image, NSError *error) {
         if (!image) return;
-        CGRect content = [self pictureAreaIn:image below:[self cropTopFor:frame]];
+        CGRect lit = [self litAreaIn:image below:top];
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (CGRectIsNull(content) || self->_stream != stream) return;
-            self->_contentFound = YES;
-            if (CGRectGetWidth(CGRectIntersection(content, self->_config.sourceRect)) > 0 &&
-                fabs(content.origin.x - self->_config.sourceRect.origin.x) < 2 && fabs(content.origin.y - self->_config.sourceRect.origin.y) < 2 &&
-                fabs(content.size.width - self->_config.sourceRect.size.width) < 2 && fabs(content.size.height - self->_config.sourceRect.size.height) < 2) return;
-            fprintf(stderr, "Picture area %.0fx%.0f at (%.0f, %.0f) in the %.0fx%.0f window\n", content.size.width, content.size.height,
-                    content.origin.x, content.origin.y, frame.size.width, frame.size.height);
-            self->_config.sourceRect = content;
+            if (CGRectIsNull(lit) || self->_stream != stream) return;
+            self->_litArea = CGRectIsEmpty(self->_litArea) ? lit : CGRectUnion(self->_litArea, lit);
+            CGRect area = self->_litArea;
+            // Anything that is not a 16:9 picture (an ordinary window, or too little seen so far) is captured whole.
+            CGRect target = CGRectMake(0, top, frame.size.width, frame.size.height - top);
+            if (area.size.width >= frame.size.width * 0.4 && fabs(area.size.width / area.size.height - 16.0 / 9.0) <= 0.07) {
+                // The smallest 16:9 rectangle containing the lit area: showing a sliver of border beats cutting picture.
+                CGFloat width = MIN(MAX(area.size.width, area.size.height * 16.0 / 9.0), frame.size.width), height = width * 9.0 / 16.0;
+                CGFloat x = MIN(MAX(CGRectGetMidX(area) - width / 2, 0), frame.size.width - width);
+                CGFloat y = MAX(MIN(CGRectGetMidY(area) - height / 2, frame.size.height - height), top);
+                target = CGRectMake(x, y, width, height);
+            }
+            CGRect current = self->_config.sourceRect;
+            if (fabs(target.origin.x - current.origin.x) < 1.5 && fabs(target.origin.y - current.origin.y) < 1.5 &&
+                fabs(target.size.width - current.size.width) < 1.5 && fabs(target.size.height - current.size.height) < 1.5) return;
+            fprintf(stderr, "Capturing %.0fx%.0f at (%.0f, %.0f) of the %.0fx%.0f window\n", target.size.width, target.size.height,
+                    target.origin.x, target.origin.y, frame.size.width, frame.size.height);
+            self->_config.sourceRect = target;
             [stream updateConfiguration:self->_config completionHandler:^(NSError *updateError) {
-                if (updateError) fprintf(stderr, "Could not crop to the picture area: %s\n", updateError.localizedDescription.UTF8String);
+                if (updateError) fprintf(stderr, "Could not change the captured area: %s\n", updateError.localizedDescription.UTF8String);
             }];
         });
     }];
 }
 
-// Returns the 16:9 picture area in image coordinates (top-left origin), or CGRectNull when none is evident.
-- (CGRect)pictureAreaIn:(CGImageRef)image below:(CGFloat)top {
+// Returns the bounding box of everything that is not black, in image coordinates (top-left origin).
+- (CGRect)litAreaIn:(CGImageRef)image below:(CGFloat)top {
     size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
     if (width < 64 || height < 64) return CGRectNull;
     uint8_t *gray = calloc(width * height, 1);
@@ -337,11 +350,8 @@ static NSString *FourCC(OSType code) {
     while (x0 < x1 && !columnLit(x0, y0, y1)) x0++;
     while (x1 > x0 && !columnLit(x1 - 1, y0, y1)) x1--;
     free(gray);
-    double w = (double)(x1 - x0), h = (double)(y1 - y0);
-    if (w < width * 0.4 || h < 64 || fabs(w / h - 16.0 / 9.0) > 0.07) return CGRectNull;
-    // Snap to exactly 16:9 inside the detected area so the capture fills the processing size with no borders.
-    double snappedW = MIN(w, h * 16.0 / 9.0), snappedH = snappedW * 9.0 / 16.0;
-    return CGRectMake(x0 + (w - snappedW) / 2, y0 + (h - snappedH) / 2, snappedW, snappedH);
+    if (x1 <= x0 + 32 || y1 <= y0 + 32) return CGRectNull;
+    return CGRectMake(x0, y0, x1 - x0, y1 - y0);
 }
 
 - (OSType)startInterpolatorWidth:(NSInteger)width height:(NSInteger)height {
@@ -460,6 +470,7 @@ static NSString *FourCC(OSType code) {
     view.toggleFullScreen = ^{ [weakSelf toggleFullScreen]; };
     view.isFullScreen = ^BOOL { Smoother *me = weakSelf; return me ? me->_fullScreen : NO; };
     view.wantsLayer = YES;
+    view.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
     self.panel.contentView = view;
 
     _layer = [CALayer new];
@@ -486,7 +497,10 @@ static NSString *FourCC(OSType code) {
         if (!_fullPanel) {
             _fullPanel = [[OutputPanel alloc] initWithContentRect:screen.frame styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
                                                           backing:NSBackingStoreBuffered defer:NO];
-            _fullPanel.backgroundColor = NSColor.blackColor;
+            // Declared non-opaque although the black view fills it: a window hidden behind an opaque one counts as
+            // occluded, and an occluded app that is also silent (a menu screen) gets its drawing throttled by macOS.
+            _fullPanel.opaque = NO;
+            _fullPanel.backgroundColor = NSColor.clearColor;
             _fullPanel.level = NSScreenSaverWindowLevel;
             _fullPanel.hidesOnDeactivate = NO;
             _fullPanel.hasShadow = NO;
@@ -544,12 +558,16 @@ static NSString *FourCC(OSType code) {
     // a third faint frame is taken as real motion that slowed down.
     // A second repeat in a row must also be about as faint as the first; otherwise real motion that has just slowed
     // sharply (a fast pan coming to rest) would be dropped as two repeats and show as a short freeze.
+    // After a still period the last real frame's difference says nothing about the next change (a cursor moving
+    // in a menu after a page transition would be dropped as a faint repeat), so the reference is forgotten.
+    double now = HostNow();
+    if (now - _lastNewTime > 0.15) _lastNewMean = 0;
     BOOL refinement = NO;
     if (_repeatsInRow == 0) refinement = mean < self.dupThreshold * _lastNewMean;
     else if (_repeatsInRow == 1) refinement = mean < MAX(2.5 * _lastRepeatMean, 0.08 * _lastNewMean);
     BOOL duplicate = comparable && (identical || refinement);
     _repeatsInRow = duplicate ? _repeatsInRow + 1 : 0;
-    if (duplicate) _lastRepeatMean = mean; else _lastNewMean = mean;
+    if (duplicate) _lastRepeatMean = mean; else { _lastNewMean = mean; _lastNewTime = now; }
     // A cut changes far more of the picture than the motion around it; blending across one smears two scenes together.
     // A false alarm only costs one middle frame, so the bar is low.
     _sceneCut = comparable && !duplicate && mean > 12.0 && mean > 2.5 * _motionLevel;
@@ -765,6 +783,7 @@ int main(int argc, const char *argv[]) {
         smoother.cushion = 1;
         smoother.cropTop = -1;
         smoother.logStalls = YES;
+        smoother.upscale = YES;
         double seconds = 0;
         for (int i = 1; i < argc; i++) {
             NSString *flag = @(argv[i]);
@@ -773,7 +792,7 @@ int main(int argc, const char *argv[]) {
             else if ([flag isEqual:@"--fullscreen"]) smoother.startFullScreen = YES;
             else if ([flag isEqual:@"--no-stalls"]) smoother.logStalls = NO;
             else if ([flag isEqual:@"--debug-diff"]) smoother.debugDiff = YES;
-            else if ([flag isEqual:@"--upscale"]) smoother.upscale = YES;
+            else if ([flag isEqual:@"--no-upscale"]) smoother.upscale = NO;
             else if ([flag isEqual:@"--match"] && value) { smoother.match = value; i++; }
             else if ([flag isEqual:@"--height"] && value) { smoother.targetHeight = value.integerValue; i++; }
             else if ([flag isEqual:@"--width"] && value) { smoother.targetWidth = value.integerValue; i++; }
