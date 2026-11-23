@@ -53,6 +53,7 @@ For troubleshooting:
 | `--no-stalls` | Do not print stalls |
 | `--passthrough` | No interpolation, for comparison |
 | `--debug-diff` | Print how each captured frame was classified |
+| `--interp-size <WxH>` | Interpolate at this size instead of 1280×720. Above 1280×720's pixels the interpolator runs a slower network whose middle frames are closer to the real ones: 1284x722 measured +2.4 dB on an M2 Pro, at 15 ms instead of 8 ms a call. Not measured on an M1 |
 
 ### What it prints
 
@@ -131,6 +132,8 @@ Things that cost time to find:
 - **Commit deadline.** A commit needs about 12.5 ms before a refresh to make it.
 - **GPU contention.** GPU work running across the compositor's snapshot point makes it miss
   refreshes, so the second upscale of each pair waits until that point has passed.
+- **Interpolator padding.** Above 1280×720 the interpolator's buffer attributes ask for extended
+  pixels. A 1280×720 pool built from them crashed the super-resolution scaler.
 - **Upscaling off the capture queue.** Each new frame needs an interpolation and two upscales. Run
   one after another on the capture queue they can outlast a 30 fps frame interval, so the real
   frame's upscale runs on a queue of its own. Measured, it and the next interpolation do not slow

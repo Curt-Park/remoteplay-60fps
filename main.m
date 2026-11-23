@@ -61,6 +61,7 @@ static NSString *FourCC(OSType code) {
 @property NSInteger cushion;   // extra refreshes of delay allowed for absorbing uneven frame arrival
 @property BOOL steady;         // keep the extra refresh once it is in use instead of giving it back
 @property BOOL upscale;   // super-resolve every shown frame 1.5x after interpolation
+@property NSInteger interpolationWidth, interpolationHeight;   // 0 = the capture size
 @property NSPanel *panel;
 @end
 
@@ -71,6 +72,11 @@ static NSString *FourCC(OSType code) {
     NSArray *_onScreen;
     VTFrameProcessor *_processor;
     CVPixelBufferPoolRef _pool;
+    // Interpolating at a size other than the capture's: captures are scaled into _largePool, middles come out of
+    // _largeMiddlePool and are scaled back into _pool. The last enlarged capture is kept for the next pair.
+    VTPixelTransferSessionRef _transfer;
+    CVPixelBufferPoolRef _largePool, _largeMiddlePool;
+    CVPixelBufferRef _largeCache, _largeCacheSource;
     VTFrameProcessor *_scaler;
     CVPixelBufferPoolRef _scaledPool;
     id<MTLDevice> _metalDevice;
@@ -246,6 +252,9 @@ static NSString *FourCC(OSType code) {
         self->_previousFrame = NULL;
         CVPixelBufferRelease(self->_restFrame);
         self->_restFrame = NULL;
+        CVPixelBufferRelease(self->_largeCache);
+        CVPixelBufferRelease(self->_largeCacheSource);
+        self->_largeCache = self->_largeCacheSource = NULL;
         self->_captureGeneration++;
         self->_failed = 0;
     });
@@ -397,21 +406,35 @@ static NSString *FourCC(OSType code) {
     return CGRectMake(x0, y0, x1 - x0, y1 - y0);
 }
 
+static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteger height, OSType format) {
+    NSMutableDictionary *attributes = [base mutableCopy];
+    attributes[(id)kCVPixelBufferWidthKey] = @(width);
+    attributes[(id)kCVPixelBufferHeightKey] = @(height);
+    attributes[(id)kCVPixelBufferPixelFormatTypeKey] = @(format);
+    attributes[(id)kCVPixelBufferIOSurfacePropertiesKey] = @{};
+    CVPixelBufferPoolRef pool = NULL;
+    CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)attributes, &pool);
+    return pool;
+}
+
 - (OSType)startInterpolatorWidth:(NSInteger)width height:(NSInteger)height {
     if (![VTLowLatencyFrameInterpolationConfiguration isSupported]) {
         fprintf(stderr, "Low-latency frame interpolation is not supported on this Mac.\n");
         exit(1);
     }
+    // Above 1280x720's pixels the interpolator runs a slower network whose middle frames are closer to the real ones
+    // (measured on an M2 Pro: +2.4 dB at 1284x722 for 720p frames, 12 -> 20 ms a call).
+    NSInteger interpWidth = self.interpolationWidth ?: width, interpHeight = self.interpolationHeight ?: height;
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 270000   // these are declared from the macOS 27 SDK on
     NSInteger maxPixels = [VTLowLatencyFrameInterpolationConfiguration maximumPixelCountForSpatialScaleFactor:1];
     NSInteger maxDimension = [VTLowLatencyFrameInterpolationConfiguration maximumDimensionForSpatialScaleFactor:1];
     fprintf(stderr, "Interpolator limits: %ld pixels, %ld max dimension (request is %ld pixels)\n",
-            (long)maxPixels, (long)maxDimension, (long)(width * height));
+            (long)maxPixels, (long)maxDimension, (long)(interpWidth * interpHeight));
 #endif
     VTLowLatencyFrameInterpolationConfiguration *config =
-        [[VTLowLatencyFrameInterpolationConfiguration alloc] initWithFrameWidth:width frameHeight:height numberOfInterpolatedFrames:1];
+        [[VTLowLatencyFrameInterpolationConfiguration alloc] initWithFrameWidth:interpWidth frameHeight:interpHeight numberOfInterpolatedFrames:1];
     if (!config) {
-        fprintf(stderr, "Interpolator rejected %ldx%ld; showing frames without interpolation.\n", (long)width, (long)height);
+        fprintf(stderr, "Interpolator rejected %ldx%ld; showing frames without interpolation.\n", (long)interpWidth, (long)interpHeight);
         return 0;
     }
     NSMutableString *formats = [NSMutableString string];
@@ -433,15 +456,28 @@ static NSString *FourCC(OSType code) {
         return 0;
     }
     _processor = processor;
-    fprintf(stderr, "Interpolator ready in %.0f ms\n", (HostNow() - begin) * 1000);
+    fprintf(stderr, "Interpolator ready at %ldx%ld in %.0f ms\n", (long)interpWidth, (long)interpHeight, (HostNow() - begin) * 1000);
 
-    NSMutableDictionary *attributes = [config.destinationPixelBufferAttributes mutableCopy];
-    attributes[(id)kCVPixelBufferWidthKey] = @(width);
-    attributes[(id)kCVPixelBufferHeightKey] = @(height);
-    attributes[(id)kCVPixelBufferPixelFormatTypeKey] = @(chosen);
-    attributes[(id)kCVPixelBufferIOSurfacePropertiesKey] = @{};
-    CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)attributes, &_pool);
+    BOOL scaled = interpWidth != width || interpHeight != height;
+    // Middles scaled back to the capture size must not inherit the interpolator's padding (above 1280x720 it asks for
+    // extended pixels), which made the super-resolution scaler crash.
+    _pool = NewPool(scaled ? @{} : config.destinationPixelBufferAttributes, width, height, chosen);
+    if (scaled) {
+        VTPixelTransferSessionCreate(NULL, &_transfer);
+        _largePool = NewPool(config.sourcePixelBufferAttributes, interpWidth, interpHeight, chosen);
+        _largeMiddlePool = NewPool(config.destinationPixelBufferAttributes, interpWidth, interpHeight, chosen);
+    }
     return chosen;
+}
+
+// Returns a retained copy of a capture at the interpolation size, or NULL.
+- (CVPixelBufferRef)enlarged:(CVPixelBufferRef)buffer {
+    CVPixelBufferRef large = NULL;
+    CVPixelBufferPoolCreatePixelBuffer(NULL, _largePool, &large);
+    if (!large) return NULL;
+    CVBufferPropagateAttachments(buffer, large);
+    if (VTPixelTransferSessionTransferImage(_transfer, buffer, large) != noErr) { CVPixelBufferRelease(large); return NULL; }
+    return large;
 }
 
 - (void)startScalerWidth:(NSInteger)width height:(NSInteger)height format:(OSType)format {
@@ -779,11 +815,39 @@ static NSString *FourCC(OSType code) {
 // Returns the frames at the given phases between the two inputs, oldest first, or nil on failure.
 - (NSArray *)interpolateFrom:(CVPixelBufferRef)previous at:(double)previousTime to:(CVPixelBufferRef)current at:(double)currentTime
                       phases:(NSArray<NSNumber *> *)phases with:(VTFrameProcessor *)processor {
+    if (!_transfer) return [self interpolatePair:previous at:previousTime to:current at:currentTime phases:phases with:processor into:_pool];
+    CVPixelBufferRef largePrevious = previous == _largeCacheSource && _largeCache ? CVPixelBufferRetain(_largeCache) : [self enlarged:previous];
+    CVPixelBufferRef largeCurrent = [self enlarged:current];
+    NSArray *large = largePrevious && largeCurrent ?
+        [self interpolatePair:largePrevious at:previousTime to:largeCurrent at:currentTime phases:phases with:processor into:_largeMiddlePool] : nil;
+    if (largeCurrent) {
+        CVPixelBufferRelease(_largeCache);
+        CVPixelBufferRelease(_largeCacheSource);
+        _largeCache = CVPixelBufferRetain(largeCurrent);
+        _largeCacheSource = CVPixelBufferRetain(current);
+    }
+    CVPixelBufferRelease(largePrevious);
+    CVPixelBufferRelease(largeCurrent);
+    if (!large) return nil;
+    NSMutableArray *scaled = [NSMutableArray array];
+    for (id frame in large) {
+        CVPixelBufferRef small = NULL;
+        CVPixelBufferPoolCreatePixelBuffer(NULL, _pool, &small);
+        if (!small) return nil;
+        [scaled addObject:(__bridge_transfer id)small];
+        CVBufferPropagateAttachments((__bridge CVPixelBufferRef)frame, small);
+        if (VTPixelTransferSessionTransferImage(_transfer, (__bridge CVPixelBufferRef)frame, small) != noErr) return nil;
+    }
+    return scaled;
+}
+
+- (NSArray *)interpolatePair:(CVPixelBufferRef)previous at:(double)previousTime to:(CVPixelBufferRef)current at:(double)currentTime
+                      phases:(NSArray<NSNumber *> *)phases with:(VTFrameProcessor *)processor into:(CVPixelBufferPoolRef)pool {
     NSMutableArray *buffers = [NSMutableArray array];
     NSMutableArray<VTFrameProcessorFrame *> *outputs = [NSMutableArray array];
     for (NSNumber *phase in phases) {
         CVPixelBufferRef destination = NULL;
-        CVPixelBufferPoolCreatePixelBuffer(NULL, _pool, &destination);
+        CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &destination);
         if (!destination) return nil;
         CVBufferPropagateAttachments(current, destination);
         [buffers addObject:(__bridge_transfer id)destination];
@@ -1005,6 +1069,13 @@ int main(int argc, const char *argv[]) {
             // 720p and no spare refresh at all: always 33 ms, at the price of a hold whenever a source frame is late.
             else if ([flag isEqual:@"--low-latency"]) { smoother.upscale = NO; smoother.steady = NO; smoother.cushion = 0; lowLatency = YES; }
             else if ([flag isEqual:@"--crop-top"] && value) { smoother.cropTop = value.doubleValue; i++; }
+            else if ([flag isEqual:@"--interp-size"] && value) {
+                NSArray<NSString *> *parts = [value componentsSeparatedByString:@"x"];
+                if (parts.count != 2 || parts[0].integerValue < 64 || parts[1].integerValue < 64) { fprintf(stderr, "--interp-size takes WxH\n"); return 2; }
+                smoother.interpolationWidth = parts[0].integerValue & ~1;
+                smoother.interpolationHeight = parts[1].integerValue & ~1;
+                i++;
+            }
             else if ([flag isEqual:@"--sharpen"] && value) { smoother.sharpness = value.doubleValue; sharpnessGiven = YES; i++; }
             else if ([flag isEqual:@"--no-stalls"]) smoother.logStalls = NO;
             else if ([flag isEqual:@"--passthrough"]) smoother.passthrough = YES;
