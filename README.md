@@ -131,6 +131,10 @@ Things that cost time to find:
 - **Commit deadline.** A commit needs about 12.5 ms before a refresh to make it.
 - **GPU contention.** GPU work running across the compositor's snapshot point makes it miss
   refreshes, so the second upscale of each pair waits until that point has passed.
+- **Upscaling off the capture queue.** Each new frame needs an interpolation and two upscales. Run
+  one after another on the capture queue they can outlast a 30 fps frame interval, so the real
+  frame's upscale runs on a queue of its own. Measured, it and the next interpolation do not slow
+  each other.
 - **Faster source displays.** On a 120 Hz display each 30 fps frame is captured four times, twice
   as exact copies. Counting those copies as repeats made the next faint re-encode look like a new
   frame, so exact copies are not counted.

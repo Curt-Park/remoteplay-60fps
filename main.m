@@ -97,8 +97,11 @@ static NSString *FourCC(OSType code) {
     // scheduling state, capture queue only
     double _lastTarget, _behindSum;
     int _spareStreak, _holds, _trims, _behindCount;
-    double _interpSum, _interpMax, _captureLagSum, _scaleSum;
+    double _interpSum, _interpMax, _captureLagSum, _scaleSum;   // _scaleSum and _scaled are guarded by @synchronized(_pending)
     int _scaled;
+    dispatch_queue_t _upscaleQueue;   // real frames' upscaling, beside the capture queue
+    double _frameUpscaleEstimate;     // guarded by @synchronized(_pending)
+    NSObject *_sharpenLock;
     CGWindowID _currentWindowID;
     BOOL _waitingReported;
     int _repeatsInRow, _restShown;
@@ -127,6 +130,9 @@ static NSString *FourCC(OSType code) {
 - (instancetype)init {
     self = [super init];
     _queue = dispatch_queue_create("smooth-anything.frames", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+    _upscaleQueue = dispatch_queue_create("smooth-anything.upscale", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+    _frameUpscaleEstimate = 0.008;
+    _sharpenLock = [NSObject new];
     _sourceInterval = 1.0 / 30.0;
     _pending = [NSMutableArray array];
     _period = 1.0 / 60.0;
@@ -468,10 +474,14 @@ static NSString *FourCC(OSType code) {
     double begin = HostNow();
     CVPixelBufferRef result = [self superResolved:buffer];
     if (self.sharpness > 0) {
-        CVPixelBufferRef sharper = [self sharpened:result];
+        CVPixelBufferRef sharper = NULL;
+        @synchronized (_sharpenLock) { sharper = [self sharpened:result]; }   // called from the capture and upscale queues
         if (sharper) { CVPixelBufferRelease(result); result = sharper; }
     }
-    if (result != buffer) { _scaleSum += HostNow() - begin; _scaled++; }
+    if (result != buffer) {
+        double took = HostNow() - begin;
+        @synchronized (_pending) { _scaleSum += took; _scaled++; }
+    }
     return result;
 }
 
@@ -715,7 +725,10 @@ static NSString *FourCC(OSType code) {
     NSArray *item = @[(__bridge id)buffer, @(target)];
     @synchronized (_pending) {
         if (target > _slotVsync + _period / 2) {
-            [_pending addObject:item];
+            // Kept in target order: a real frame upscaled on its own queue can arrive after a later middle frame.
+            NSUInteger index = _pending.count;
+            while (index > 0 && [_pending[index - 1][1] doubleValue] > target) index--;
+            [_pending insertObject:item atIndex:index];
             // Nothing drains the queue while the display callback is paused (output not on a live display).
             while (_pending.count > 6) { [_pending removeObjectAtIndex:0]; _missed++; }
             return;
@@ -894,18 +907,42 @@ static NSString *FourCC(OSType code) {
             CVPixelBufferRelease(middleOut);
             first += step;
         }
+        double wait = 0;
         if (_scaler) {
             // The compositor snapshots the screen at the same point of every refresh, and a captured frame's
             // timestamp is one of those points. GPU work running across the next one made the compositor miss
             // refreshes (measured on screen), so the second upscale waits until that point has passed.
             double sinceComposite = fmod(HostNow() - captureTime, period);
             double untilComposite = period - sinceComposite;
-            if (untilComposite < 0.010) usleep((useconds_t)((untilComposite + 0.002) * 1e6));
+            if (untilComposite < 0.010) wait = untilComposite + 0.002;
         }
-        CVPixelBufferRef frameOut = [self upscaled:frame];   // off the critical path: the middle frame is already on its way
-        first = MAX(first, refreshAtOrAfter(HostNow() + kCommitLead));
-        [self show:frameOut target:first];
-        CVPixelBufferRelease(frameOut);
+        if (!_scaler && self.sharpness <= 0) {
+            first = MAX(first, refreshAtOrAfter(HostNow() + kCommitLead));
+            [self show:frame target:first];
+        } else {
+            // The real frame is upscaled on a queue of its own, beside the next pair's interpolation (measured: neither
+            // slowed the other), so the capture queue keeps up with a slower interpolation. Its refresh is chosen now,
+            // from how long an upscale has taken.
+            double estimate;
+            @synchronized (_pending) { estimate = _frameUpscaleEstimate; }
+            first = MAX(first, refreshAtOrAfter(HostNow() + wait + estimate + 0.002 + kCommitLead));
+            double target = first, start = HostNow() + wait;
+            CVPixelBufferRetain(frame);
+            dispatch_async(_upscaleQueue, ^{
+                double delay = start - HostNow();
+                if (delay > 0) usleep((useconds_t)(delay * 1e6));
+                double begin = HostNow();
+                CVPixelBufferRef frameOut = [self upscaled:frame];
+                double took = HostNow() - begin;
+                @synchronized (self->_pending) {
+                    double current = self->_frameUpscaleEstimate;   // rises at once, falls slowly
+                    self->_frameUpscaleEstimate = took > current ? took : current + 0.05 * (took - current);
+                }
+                [self show:frameOut target:target];
+                CVPixelBufferRelease(frameOut);
+                CVPixelBufferRelease(frame);
+            });
+        }
         _lastTarget = first;
         _behindSum += first - sourceRefresh;
         _behindCount++;
@@ -916,17 +953,19 @@ static NSString *FourCC(OSType code) {
 
     double elapsed = arrival - _statsStart;
     if (elapsed >= 2.0) {
-        int shown, caught, missed;
-        double phase;
+        int shown, caught, missed, scaled;
+        double phase, scaleSum;
         @synchronized (_pending) {
             shown = _shown; caught = _caught; missed = _missed; phase = _phaseCount ? _phaseSum / _phaseCount : 0;
+            scaled = _scaled; scaleSum = _scaleSum;
             _shown = _caught = _missed = 0; _phaseSum = 0; _phaseCount = 0;
+            _scaled = 0; _scaleSum = 0;
         }
         fprintf(stderr, "in %.1f fps (unique %.1f, repeats %.1f) | out %.1f fps, held refreshes %d, cuts %d | interp avg %.1f ms max %.1f ms | "
                 "upscale avg %.1f ms | behind source window %.1f ms\n",
                 _captured / elapsed, _unique / elapsed, _duplicates / elapsed, shown / elapsed, _holds, _cuts,
                 _interpolated ? _interpSum / _interpolated * 1000 : 0, _interpMax * 1000,
-                _scaled ? _scaleSum / _scaled * 1000 : 0,
+                scaled ? scaleSum / scaled * 1000 : 0,
                 _behindCount ? _behindSum / _behindCount * 1000 : 0);
         if (self.debugDiff || getenv("SMOOTH_DEBUG")) fprintf(stderr, "sched: late commits %d, skipped middles %d, missed %d, rest frames %d, frame arrives %.1f ms after refresh\n",
                 caught, _trims, missed, _restShown, phase * 1000);
@@ -935,8 +974,7 @@ static NSString *FourCC(OSType code) {
         _behindSum = 0;
         _statsStart = arrival;
         _captured = _unique = _duplicates = _interpolated = _cuts = 0;
-        _interpSum = _interpMax = _captureLagSum = _scaleSum = 0;
-        _scaled = 0;
+        _interpSum = _interpMax = _captureLagSum = 0;
     }
 }
 
