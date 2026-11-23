@@ -131,6 +131,9 @@ Things that cost time to find:
 - **Commit deadline.** A commit needs about 12.5 ms before a refresh to make it.
 - **GPU contention.** GPU work running across the compositor's snapshot point makes it miss
   refreshes, so the second upscale of each pair waits until that point has passed.
+- **Faster source displays.** On a 120 Hz display each 30 fps frame is captured four times, twice
+  as exact copies. Counting those copies as repeats made the next faint re-encode look like a new
+  frame, so exact copies are not counted.
 - **Hidden windows.** A window completely covered by an opaque window is treated as hidden, and its
   captures arrive in bursts about 100 ms apart. The full-screen panel is therefore 0.999 opaque.
   Marking it non-opaque without real translucency was not enough.

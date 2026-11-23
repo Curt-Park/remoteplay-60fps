@@ -679,6 +679,13 @@ static NSString *FourCC(OSType code) {
     // A repeat is either identical or a faint re-encode of the frame before it, whose difference scales with
     // the motion in that frame. An absolute threshold would also swallow real frames in slow scenes.
     BOOL identical = mean < 0.01 && strong == 0;
+    // A display faster than the source delivers the same picture again; that copy says nothing about the source's
+    // cadence, so it does not count toward the repeats in a row (on 120 Hz, re-encodes were taken as new frames).
+    if (comparable && identical) {
+        _sceneCut = NO;
+        if (self.debugDiff) fprintf(stderr, "diff mean %.3f strong %d identical\n", mean, strong);
+        return YES;
+    }
     // Delivery jitter can hold one source frame for three refreshes, so two faint repeats in a row are allowed;
     // a third faint frame is taken as real motion that slowed down.
     // A second repeat in a row must also be about as faint as the first; otherwise real motion that has just slowed
