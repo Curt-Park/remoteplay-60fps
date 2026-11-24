@@ -63,6 +63,7 @@ the motion split evenly, 50 ms behind the decoded stream.
 | `SMOOTH_OFF=1` | Run as plain chiaki-ng |
 | `SMOOTH_NO_NATIVE=1` | Send real frames through 720p as well (slower: about 38 changes per second here) |
 | `SMOOTH_SHARPEN=<n>` | Sharpening of the middle frames, default 1.5 |
+| `SMOOTH_DEBUG=1`, `SMOOTH_DIFF=1` | Print scheduler counters, and how each decoded frame was classified |
 
 Limits: HDR streams are not supported, and while a stream is shown chiaki-ng's own menus are hidden
 under the picture. chiaki-ng is AGPL-3.0, so a binary built this way is covered by the AGPL.
@@ -193,6 +194,13 @@ Things that cost time to find:
   stream, which took the upscale from 6 ms to 10-11 ms and cost about ten frames a second on screen.
   The patch limits that to twice a second while smooth-anything has the video. It also needs the
   Vulkan loader: under the OpenGL fallback chiaki-ng renders on the main thread.
+- **Do not judge lateness against a rounded time.** Frames fed by a host arrive at any point of the refresh
+  cycle. Measured against the arrival time rounded up to a refresh, the limit flipped by a whole refresh
+  whenever frames arrived near a boundary, and 3-5 % of middle frames were skipped. Measured against the
+  arrival time itself, none were (2,308 frames, 753 of them within 3 ms of a boundary).
+- **What is left is the source.** In a 60 fps Remote Play stream of a 30 fps game about 3 % of game frames
+  are held for three refreshes instead of two, and most are not made up afterwards. Each costs one held
+  refresh in the output: `out` is exactly twice `unique` in every two-second window.
 - **Hidden windows.** A window completely covered by an opaque window is treated as hidden, and its
   captures arrive in bursts about 100 ms apart. The full-screen panel is therefore 0.999 opaque.
   Marking it non-opaque without real translucency was not enough.

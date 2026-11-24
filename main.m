@@ -1162,11 +1162,25 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         // on screen (51 changes a second against 59).
         if (self.steady) first = MAX(first, sourceRefresh + (1 + self.cushion) * step);
         if (middleOut) {
-            BOOL behind = first > sourceRefresh + (1 + self.cushion) * step + period / 2;
-            // A spare refresh of delay that has gone unused for 3 s is given back.
-            BOOL spare = first > refreshAtOrAfter(HostNow() + kCommitLead + 0.003) + period / 2;
+            BOOL behind, spare;
+            if (self.steady) {
+                // Judged against the arrival time itself, not against the source refresh. The source refresh is the
+                // arrival time rounded up to a refresh, so for frames arriving right around a refresh boundary it
+                // flips between two neighbouring refreshes from one frame to the next, and a limit measured from
+                // it moved with it: the even timeline looked a refresh late on every flip and its middle frame was
+                // skipped (measured: 3-5 % of frames, all arriving within 3 ms of a boundary). The limit leaves a
+                // band a refresh and a half wide above the minimum delay, so arrival jitter cannot cross both edges.
+                // A captured window's timestamps sit at a fixed point of the refresh cycle, so there the source refresh is stable.
+                double reference = self.embedded ? captureTime : sourceRefresh;
+                behind = first - reference > (2 + self.cushion) * step + period / 2;
+                spare = NO;
+            } else {
+                behind = first > sourceRefresh + (1 + self.cushion) * step + period / 2;
+                // A spare refresh of delay that has gone unused for 3 s is given back.
+                spare = first > refreshAtOrAfter(HostNow() + kCommitLead + 0.003) + period / 2;
+            }
             _spareStreak = spare ? _spareStreak + 1 : 0;
-            BOOL giveBack = !self.steady && _spareStreak >= 90;
+            BOOL giveBack = _spareStreak >= 90;
             if (behind || giveBack) {
                 CVPixelBufferRelease(middleOut);
                 middleOut = NULL;
@@ -1323,6 +1337,7 @@ void SmoothSubmit(CVPixelBufferRef frame) {
         smoother.embedded = YES;
         if (getenv("SMOOTH_NO_UPSCALE")) { smoother.upscale = NO; smoother.steady = NO; }
         if (getenv("SMOOTH_SHARPEN")) smoother.sharpness = atof(getenv("SMOOTH_SHARPEN"));
+        if (getenv("SMOOTH_DIFF")) smoother.debugDiff = YES;
         gEmbedded = smoother;
         dispatch_async(dispatch_get_main_queue(), ^{ [smoother attachToHostWindow]; });
     });
