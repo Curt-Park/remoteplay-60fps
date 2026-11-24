@@ -36,6 +36,7 @@ Use a 1080p SDR stream. During a stream chiaki-ng's own menus are hidden under t
 | Environment variable | Effect |
 |---|---|
 | `SMOOTH_OFF=1` | Run as plain chiaki-ng |
+| `SMOOTH_BLEND=<0–0.9>` | Keep this share of the previous picture in each new one, as a slow panel does. Middle frames go wrong in fast motion; a MacBook's mini-LED panel smears that away, a fast IPS monitor shows it. Blending hides it there at the cost of some motion blur; try 0.3–0.5. A scene cut starts a fresh picture |
 | `SMOOTH_INTERP_1080=1` | Interpolate at 1920×1080 instead of 1280×720. The interpolator then runs a slower, more accurate network, and the middle frame needs no upscale. Needs an M2 Pro or faster: about 20 ms a call there, about 100 ms on an M1 |
 | `SMOOTH_DEBUG=1` | Print a status line every two seconds |
 | `SMOOTH_DIFF=1` | Print how each decoded frame was classified |
@@ -63,7 +64,8 @@ Use a 1080p SDR stream. During a stream chiaki-ng's own menus are hidden under t
    interpolated at 1080p.
 5. **Schedule** the middle frame and the untouched real frame for consecutive display refreshes.
 6. **Present** through a `CAMetalLayer` in a borderless child window over chiaki-ng's content, once
-   per refresh from a display link on its own thread.
+   per refresh from a display link on its own thread. With `SMOOTH_BLEND` each picture is mixed with
+   the previous one on the way.
 
 ## Measured on an M1 Mac mini (macOS 27, 60 Hz display, GTA 6 at 1080p)
 
