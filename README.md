@@ -7,8 +7,9 @@ into [chiaki-ng](https://github.com/chiaki-ng/chiaki-ng), the open-source Remote
 inserts a generated frame between every two game frames, so the game plays at 60 fps on a Mac. It
 uses only Apple frameworks (VideoToolbox, Metal, Core Animation).
 
-MIT licensed; a binary built with chiaki-ng is covered by chiaki-ng's AGPL-3.0. Not affiliated with
-Sony.
+MIT licensed, except `smooth-hook.patch`, which modifies chiaki-ng and is under chiaki-ng's
+AGPL-3.0 (with its OpenSSL exception). A binary built with chiaki-ng is covered by the AGPL-3.0 as
+well. Not affiliated with Sony.
 
 ## Requirements
 

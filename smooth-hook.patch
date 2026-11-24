@@ -1,3 +1,6 @@
+Changes to chiaki-ng v1.10.1, licensed like chiaki-ng itself (AGPL-3.0-only with its OpenSSL exception).
+SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
+
 diff --git a/gui/CMakeLists.txt b/gui/CMakeLists.txt
 index 7e777e1f..adf7c37d 100755
 --- a/gui/CMakeLists.txt
