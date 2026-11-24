@@ -33,7 +33,6 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 @implementation Smoother {
     dispatch_queue_t _queue;
     BOOL _debug, _debugDiff, _prepared;
-    double _maxMotion;
     int _failed;
 
     VTFrameProcessor *_processor;
@@ -85,7 +84,6 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     _sourceInterval = 1.0 / 30.0;
     _debug = getenv("SMOOTH_DEBUG") != NULL;
     _debugDiff = getenv("SMOOTH_DIFF") != NULL;
-    _maxMotion = getenv("SMOOTH_MAX_MOTION") ? atof(getenv("SMOOTH_MAX_MOTION")) : 255;
     _device = MTLCreateSystemDefaultDevice();
     _commands = [_device newCommandQueue];
     CVMetalTextureCacheCreate(NULL, NULL, _device, NULL, &_textures);
@@ -439,7 +437,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         @synchronized (_pending) { period = _period; }
 
         CVPixelBufferRef middleOut = NULL;
-        if (_previousFrame && gap < 0.100 && !_sceneCut && _lastNewMean <= _maxMotion) {
+        if (_previousFrame && gap < 0.100 && !_sceneCut) {
             double begin = HostNow();
             CVPixelBufferRef middle = [self interpolateFrom:_previousFrame at:_previousTime to:small at:received];
             _interpSum += HostNow() - begin;

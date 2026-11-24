@@ -36,7 +36,6 @@ Use a 1080p SDR stream. During a stream chiaki-ng's own menus are hidden under t
 | Environment variable | Effect |
 |---|---|
 | `SMOOTH_OFF=1` | Run as plain chiaki-ng |
-| `SMOOTH_MAX_MOTION=<n>` | Show no middle frame when the picture changed by more than this (mean luma difference, 0–255). Fast turns then run at 30 fps instead of smearing; around 12–15 is where smearing starts |
 | `SMOOTH_DEBUG=1` | Print a status line every two seconds |
 | `SMOOTH_DIFF=1` | Print how each decoded frame was classified |
 
@@ -120,6 +119,7 @@ Tried and dropped on the M1:
 | In middle frames, taking still areas from the two real frames | Measurably closer to the real frames, no visible difference, and it erased thin objects crossing between frames |
 | Sharpening the middle frames | A frame rebuilt from 720p is 0.9 luma levels from its native original unsharpened and 2.3 at sharpness 1.5; alternating with native frames, that shimmered |
 | A second interpolation of the pair shrunk to 640×360 inside a 720p canvas, merged in where the two results differ | Follows large motion in still comparisons (about 14 ms per frame, 60 fps kept), but no visible improvement in play |
+| Showing no middle frame when the picture changed a lot | Removes the smear but those moments run at 30 fps |
 | Showing real frames through 720p as well | Softer and slower (about 38 fps) |
 
 Earlier versions captured a window with ScreenCaptureKit instead of taking frames from chiaki-ng.
