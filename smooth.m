@@ -33,11 +33,16 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 @implementation Smoother {
     dispatch_queue_t _queue;
     BOOL _debug, _debugDiff, _prepared;
-    double _sharpness, _maxMotion;
+    double _sharpness, _maxMotion, _coarseMotion;
     int _failed;
 
-    VTFrameProcessor *_processor;
-    CVPixelBufferPoolRef _middlePool;
+    VTFrameProcessor *_processor, *_coarseProcessor;
+    CVPixelBufferPoolRef _middlePool, _canvasPool;
+    dispatch_queue_t _coarseQueue;
+    id<MTLComputePipelineState> _shrinkLuma, _shrinkChroma, _mergeLuma, _mergeChroma, _weightMap;
+    id<MTLTexture> _weights;
+    CVPixelBufferRef _previousCanvas;
+    BOOL _coarse;
     VTFrameProcessor *_scaler;
     CVPixelBufferPoolRef _scaledPool;
     VTPixelTransferSessionRef _transfer;
@@ -75,7 +80,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 
     double _sourceInterval, _lastTarget;
 
-    double _statsStart, _interpSum, _scaleSum, _delaySum;
+    double _statsStart, _interpSum, _scaleSum, _delaySum, _coarseShare;
     int _received, _unique, _interpolated, _scaled, _cuts, _holds, _skipped, _delayCount;
 }
 
@@ -90,6 +95,9 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     _debugDiff = getenv("SMOOTH_DIFF") != NULL;
     _sharpness = getenv("SMOOTH_SHARPEN") ? atof(getenv("SMOOTH_SHARPEN")) : 0;
     _maxMotion = getenv("SMOOTH_MAX_MOTION") ? atof(getenv("SMOOTH_MAX_MOTION")) : 255;
+    _coarseMotion = getenv("SMOOTH_COARSE_MOTION") ? atof(getenv("SMOOTH_COARSE_MOTION")) : 6;
+    _coarse = _coarseMotion < 255;
+    _coarseQueue = dispatch_queue_create("smooth.coarse", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
     _device = MTLCreateSystemDefaultDevice();
     _commands = [_device newCommandQueue];
     CVMetalTextureCacheCreate(NULL, NULL, _device, NULL, &_textures);
@@ -108,6 +116,8 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         if (config && [processor startSessionWithConfiguration:config error:&error]) {
             _processor = processor;
             _middlePool = NewPool(config.destinationPixelBufferAttributes, kProcessWidth, kProcessHeight);
+            VTFrameProcessor *coarse = [VTFrameProcessor new];
+            if (_coarse && [coarse startSessionWithConfiguration:config error:nil] && [self prepareCoarse]) _coarseProcessor = coarse;
         } else {
             fprintf(stderr, "smooth: interpolation unavailable: %s\n", error.description.UTF8String);
         }
@@ -131,7 +141,8 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     CVPixelBufferPoolCreatePixelBuffer(NULL, _smallPool, &blankA);
     CVPixelBufferPoolCreatePixelBuffer(NULL, _smallPool, &blankB);
     for (int round = 0; round < 2 && blankA && blankB; round++) {
-        CVPixelBufferRef middle = [self interpolateFrom:blankA at:0 to:blankB at:1.0 / 30];
+        CVPixelBufferRelease([self interpolateFrom:blankA at:0 to:blankB at:1.0 / 30 with:_coarseProcessor]);
+        CVPixelBufferRef middle = [self interpolateFrom:blankA at:0 to:blankB at:1.0 / 30 with:_processor];
         CVPixelBufferRef finished = [self finished:middle ?: blankB large:YES];
         CVPixelBufferRelease(finished);
         CVPixelBufferRelease(middle);
@@ -143,8 +154,9 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     _scaled = 0;
 }
 
-- (CVPixelBufferRef)interpolateFrom:(CVPixelBufferRef)previous at:(double)previousTime to:(CVPixelBufferRef)current at:(double)currentTime {
-    if (!_processor) return NULL;
+- (CVPixelBufferRef)interpolateFrom:(CVPixelBufferRef)previous at:(double)previousTime to:(CVPixelBufferRef)current at:(double)currentTime
+                             with:(VTFrameProcessor *)processor {
+    if (!processor) return NULL;
     CVPixelBufferRef destination = NULL;
     CVPixelBufferPoolCreatePixelBuffer(NULL, _middlePool, &destination);
     if (!destination) return NULL;
@@ -156,12 +168,175 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         [[VTLowLatencyFrameInterpolationParameters alloc] initWithSourceFrame:source previousFrame:reference
                                                            interpolationPhase:@[@0.5f] destinationFrames:@[output]] : nil;
     NSError *error = nil;
-    if (!parameters || ![_processor processWithParameters:parameters error:&error]) {
+    if (!parameters || ![processor processWithParameters:parameters error:&error]) {
         if (_failed++ == 0) fprintf(stderr, "smooth: interpolation failed: %s\n", error ? error.description.UTF8String : "frames rejected");
         CVPixelBufferRelease(destination);
         return NULL;
     }
     return destination;
+}
+
+- (BOOL)prepareCoarse {
+    static NSString *const shader = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        "constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);\n"
+        "kernel void shrinkLuma(texture2d<float, access::sample> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]],\n"
+        "                       uint2 gid [[thread_position_in_grid]]) {\n"
+        "    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;\n"
+        "    float2 size = float2(dst.get_width(), dst.get_height());\n"
+        "    bool inside = gid.x < dst.get_width() / 2 && gid.y < dst.get_height() / 2;\n"
+        "    float v = inside ? src.sample(s, (float2(gid) * 2.0 + 1.0) / size).r : 16.0 / 255.0;\n"
+        "    dst.write(float4(v, 0, 0, 1), gid);\n"
+        "}\n"
+        "kernel void shrinkChroma(texture2d<float, access::sample> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]],\n"
+        "                         uint2 gid [[thread_position_in_grid]]) {\n"
+        "    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;\n"
+        "    float2 size = float2(dst.get_width(), dst.get_height());\n"
+        "    bool inside = gid.x < dst.get_width() / 2 && gid.y < dst.get_height() / 2;\n"
+        "    float2 v = inside ? src.sample(s, (float2(gid) * 2.0 + 1.0) / size).rg : float2(0.5);\n"
+        "    dst.write(float4(v, 0, 1), gid);\n"
+        "}\n"
+        "kernel void weightMap(texture2d<float, access::sample> fine [[texture(0)]], texture2d<float, access::sample> coarse [[texture(1)]],\n"
+        "                      texture2d<float, access::sample> prev [[texture(2)]], texture2d<float, access::sample> cur [[texture(3)]],\n"
+        "                      texture2d<float, access::write> dst [[texture(4)]], constant float &everywhere [[buffer(0)]],\n"
+        "                      uint2 gid [[thread_position_in_grid]]) {\n"
+        "    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;\n"
+        "    float2 uv = (float2(gid) + 0.5) / float2(dst.get_width(), dst.get_height());\n"
+        "    float2 px = 1.0 / float2(fine.get_width(), fine.get_height());\n"
+        "    float differs = 0, moved = 0;\n"
+        "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {\n"
+        "        float2 p = uv + float2(x, y) * 12.0 * px;\n"
+        "        differs = max(differs, abs(fine.sample(s, p).r - coarse.sample(s, p * 0.5).r));\n"
+        "        moved = max(moved, abs(prev.sample(s, p).r - cur.sample(s, p).r));\n"
+        "    }\n"
+        "    float w = max(smoothstep(0.025, 0.06, differs), everywhere) * smoothstep(0.012, 0.04, moved);\n"
+        "    dst.write(float4(w, 0, 0, 1), gid);\n"
+        "}\n"
+        "kernel void mergeLuma(texture2d<float, access::sample> fine [[texture(0)]], texture2d<float, access::sample> coarse [[texture(1)]],\n"
+        "                      texture2d<float, access::sample> map [[texture(2)]], texture2d<float, access::write> dst [[texture(3)]],\n"
+        "                      uint2 gid [[thread_position_in_grid]]) {\n"
+        "    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;\n"
+        "    float2 uv = (float2(gid) + 0.5) / float2(dst.get_width(), dst.get_height());\n"
+        "    dst.write(float4(mix(fine.sample(s, uv).r, coarse.sample(s, uv * 0.5).r, map.sample(s, uv).r), 0, 0, 1), gid);\n"
+        "}\n"
+        "kernel void mergeChroma(texture2d<float, access::sample> fine [[texture(0)]], texture2d<float, access::sample> coarse [[texture(1)]],\n"
+        "                        texture2d<float, access::sample> map [[texture(2)]], texture2d<float, access::write> dst [[texture(3)]],\n"
+        "                        uint2 gid [[thread_position_in_grid]]) {\n"
+        "    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;\n"
+        "    float2 uv = (float2(gid) + 0.5) / float2(dst.get_width(), dst.get_height());\n"
+        "    dst.write(float4(mix(fine.sample(s, uv).rg, coarse.sample(s, uv * 0.5).rg, map.sample(s, uv).r), 0, 1), gid);\n"
+        "}\n";
+    NSError *error = nil;
+    id<MTLLibrary> library = [_device newLibraryWithSource:shader options:nil error:&error];
+    id<MTLComputePipelineState> (^pipeline)(NSString *) = ^id<MTLComputePipelineState>(NSString *name) {
+        id<MTLFunction> function = [library newFunctionWithName:name];
+        return function ? [self->_device newComputePipelineStateWithFunction:function error:nil] : nil;
+    };
+    _shrinkLuma = pipeline(@"shrinkLuma");
+    _shrinkChroma = pipeline(@"shrinkChroma");
+    _mergeLuma = pipeline(@"mergeLuma");
+    _mergeChroma = pipeline(@"mergeChroma");
+    _weightMap = pipeline(@"weightMap");
+    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:kProcessWidth / 4 height:kProcessHeight / 4 mipmapped:NO];
+    descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    descriptor.storageMode = MTLStorageModePrivate;
+    _weights = [_device newTextureWithDescriptor:descriptor];
+    _canvasPool = NewPool(nil, kProcessWidth, kProcessHeight);
+    BOOL ok = _shrinkLuma && _shrinkChroma && _mergeLuma && _mergeChroma && _weightMap && _weights && _canvasPool;
+    if (!ok) fprintf(stderr, "smooth: coarse interpolation unavailable: %s\n", error.localizedDescription.UTF8String);
+    return ok;
+}
+
+- (void)dispatch:(id<MTLComputeCommandEncoder>)compute pipeline:(id<MTLComputePipelineState>)pipeline width:(size_t)width height:(size_t)height {
+    NSUInteger groupWidth = pipeline.threadExecutionWidth, groupHeight = pipeline.maxTotalThreadsPerThreadgroup / groupWidth;
+    [compute setComputePipelineState:pipeline];
+    [compute dispatchThreadgroups:MTLSizeMake((width + groupWidth - 1) / groupWidth, (height + groupHeight - 1) / groupHeight, 1)
+            threadsPerThreadgroup:MTLSizeMake(groupWidth, groupHeight, 1)];
+}
+
+- (BOOL)textures:(CVMetalTextureRef *)luma :(CVMetalTextureRef *)chroma of:(CVPixelBufferRef)buffer {
+    size_t width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer);
+    CVMetalTextureCacheCreateTextureFromImage(NULL, _textures, buffer, NULL, MTLPixelFormatR8Unorm, width, height, 0, luma);
+    CVMetalTextureCacheCreateTextureFromImage(NULL, _textures, buffer, NULL, MTLPixelFormatRG8Unorm, width / 2, height / 2, 1, chroma);
+    return *luma && *chroma;
+}
+
+- (CVPixelBufferRef)shrunk:(CVPixelBufferRef)frame {
+    if (!_coarseProcessor) return NULL;
+    CVPixelBufferRef canvas = NULL;
+    CVPixelBufferPoolCreatePixelBuffer(NULL, _canvasPool, &canvas);
+    if (!canvas) return NULL;
+    CVMetalTextureRef luma[2] = {NULL}, chroma[2] = {NULL};
+    BOOL ok = [self textures:&luma[0] :&chroma[0] of:frame] && [self textures:&luma[1] :&chroma[1] of:canvas];
+    if (ok) {
+        id<MTLCommandBuffer> commands = [_commands commandBuffer];
+        id<MTLComputeCommandEncoder> compute = [commands computeCommandEncoder];
+        [compute setTexture:CVMetalTextureGetTexture(luma[0]) atIndex:0];
+        [compute setTexture:CVMetalTextureGetTexture(luma[1]) atIndex:1];
+        [self dispatch:compute pipeline:_shrinkLuma width:kProcessWidth height:kProcessHeight];
+        [compute setTexture:CVMetalTextureGetTexture(chroma[0]) atIndex:0];
+        [compute setTexture:CVMetalTextureGetTexture(chroma[1]) atIndex:1];
+        [self dispatch:compute pipeline:_shrinkChroma width:kProcessWidth / 2 height:kProcessHeight / 2];
+        [compute endEncoding];
+        [commands commit];
+        [commands waitUntilCompleted];
+        ok = commands.error == nil;
+        CVBufferPropagateAttachments(frame, canvas);
+    }
+    for (int i = 0; i < 2; i++) { if (luma[i]) CFRelease(luma[i]); if (chroma[i]) CFRelease(chroma[i]); }
+    if (!ok) { CVPixelBufferRelease(canvas); return NULL; }
+    return canvas;
+}
+
+- (float)disagreementOf:(CVPixelBufferRef)fine with:(CVPixelBufferRef)coarse {
+    CVPixelBufferLockBaseAddress(fine, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferLockBaseAddress(coarse, kCVPixelBufferLock_ReadOnly);
+    const uint8_t *f = CVPixelBufferGetBaseAddressOfPlane(fine, 0), *c = CVPixelBufferGetBaseAddressOfPlane(coarse, 0);
+    size_t fs = CVPixelBufferGetBytesPerRowOfPlane(fine, 0), cs = CVPixelBufferGetBytesPerRowOfPlane(coarse, 0);
+    long differing = 0, total = 0;
+    for (size_t y = 8; y + 1 < (size_t)kProcessHeight; y += 8) for (size_t x = 8; x + 1 < (size_t)kProcessWidth; x += 8) {
+        int average = (f[y * fs + x] + f[y * fs + x + 1] + f[(y + 1) * fs + x] + f[(y + 1) * fs + x + 1] + 2) / 4;
+        if (abs(average - (int)c[(y / 2) * cs + x / 2]) > 14) differing++;
+        total++;
+    }
+    CVPixelBufferUnlockBaseAddress(fine, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferUnlockBaseAddress(coarse, kCVPixelBufferLock_ReadOnly);
+    return total ? (float)differing / total : 0;
+}
+
+- (CVPixelBufferRef)merged:(CVPixelBufferRef)fine with:(CVPixelBufferRef)coarse between:(CVPixelBufferRef)previous and:(CVPixelBufferRef)current {
+    CVPixelBufferRef output = NULL;
+    CVPixelBufferPoolCreatePixelBuffer(NULL, _canvasPool, &output);
+    if (!output) return NULL;
+    float share = [self disagreementOf:fine with:coarse];
+    float everywhere = MIN(1.0f, MAX(0.0f, (share - 0.04f) / 0.06f));
+    _coarseShare += share;
+    CVPixelBufferRef buffers[5] = {fine, coarse, previous, current, output};
+    CVMetalTextureRef luma[5] = {NULL}, chroma[5] = {NULL};
+    BOOL ok = YES;
+    for (int i = 0; i < 5; i++) ok = [self textures:&luma[i] :&chroma[i] of:buffers[i]] && ok;
+    if (ok) {
+        id<MTLCommandBuffer> commands = [_commands commandBuffer];
+        id<MTLComputeCommandEncoder> compute = [commands computeCommandEncoder];
+        for (int i = 0; i < 4; i++) [compute setTexture:CVMetalTextureGetTexture(luma[i]) atIndex:i];
+        [compute setTexture:_weights atIndex:4];
+        [compute setBytes:&everywhere length:sizeof(everywhere) atIndex:0];
+        [self dispatch:compute pipeline:_weightMap width:kProcessWidth / 4 height:kProcessHeight / 4];
+        [compute setTexture:_weights atIndex:2];
+        [compute setTexture:CVMetalTextureGetTexture(luma[4]) atIndex:3];
+        [self dispatch:compute pipeline:_mergeLuma width:kProcessWidth height:kProcessHeight];
+        [compute setTexture:CVMetalTextureGetTexture(chroma[0]) atIndex:0];
+        [compute setTexture:CVMetalTextureGetTexture(chroma[1]) atIndex:1];
+        [compute setTexture:CVMetalTextureGetTexture(chroma[4]) atIndex:3];
+        [self dispatch:compute pipeline:_mergeChroma width:kProcessWidth / 2 height:kProcessHeight / 2];
+        [compute endEncoding];
+        [commands commit];
+        [commands waitUntilCompleted];
+        ok = commands.error == nil;
+        CVBufferPropagateAttachments(fine, output);
+    }
+    for (int i = 0; i < 5; i++) { if (luma[i]) CFRelease(luma[i]); if (chroma[i]) CFRelease(chroma[i]); }
+    if (!ok) { CVPixelBufferRelease(output); return NULL; }
+    return output;
 }
 
 - (CVPixelBufferRef)finished:(CVPixelBufferRef)buffer large:(BOOL)large {
@@ -479,6 +654,8 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     CVPixelBufferRelease(_previousFrame);
     _previousFrame = _restFrame;
     _previousTime = _restTime;
+    CVPixelBufferRelease(_previousCanvas);
+    _previousCanvas = [self shrunk:_restFrame];
     _restFrame = NULL;
     CVPixelBufferRelease(_restNative);
     _restNative = NULL;
@@ -508,10 +685,26 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         double period;
         @synchronized (_pending) { period = _period; }
 
+        CVPixelBufferRef canvas = [self shrunk:small];
         CVPixelBufferRef middleOut = NULL;
         if (_previousFrame && gap < 0.100 && !_sceneCut && _lastNewMean <= _maxMotion) {
             double begin = HostNow();
-            CVPixelBufferRef middle = [self interpolateFrom:_previousFrame at:_previousTime to:small at:received];
+            __block CVPixelBufferRef coarse = NULL;
+            dispatch_group_t group = dispatch_group_create();
+            if (canvas && _previousCanvas && _lastNewMean > _coarseMotion) {
+                CVPixelBufferRef previousCanvas = _previousCanvas;
+                double previousTime = _previousTime;
+                dispatch_group_async(group, _coarseQueue, ^{
+                    coarse = [self interpolateFrom:previousCanvas at:previousTime to:canvas at:received with:self->_coarseProcessor];
+                });
+            }
+            CVPixelBufferRef middle = [self interpolateFrom:_previousFrame at:_previousTime to:small at:received with:_processor];
+            dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+            if (middle && coarse) {
+                CVPixelBufferRef merged = [self merged:middle with:coarse between:_previousFrame and:small];
+                if (merged) { CVPixelBufferRelease(middle); middle = merged; }
+            }
+            CVPixelBufferRelease(coarse);
             _interpSum += HostNow() - begin;
             if (middle) {
                 _interpolated++;
@@ -545,6 +738,8 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         CVPixelBufferRelease(_previousFrame);
         _previousFrame = CVPixelBufferRetain(small);
         _previousTime = received;
+        CVPixelBufferRelease(_previousCanvas);
+        _previousCanvas = canvas;
     }
 
     double elapsed = received - _statsStart;
@@ -553,16 +748,16 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         int shown, missed;
         @synchronized (_pending) { shown = _shown; missed = _missed; _shown = _missed = 0; }
         fprintf(stderr, "smooth: in %.1f fps (unique %.1f) | out %.1f fps | held %d, skipped %d, missed %d, cuts %d | "
-                "interp %.1f ms, upscale %.1f ms | delay %.1f ms\n",
+                "interp %.1f ms, upscale %.1f ms | delay %.1f ms | coarse %.0f%%\n",
                 _received / elapsed, _unique / elapsed, shown / elapsed, _holds, _skipped, missed, _cuts,
                 _interpolated ? _interpSum / _interpolated * 1000 : 0, _scaled ? _scaleSum / _scaled * 1000 : 0,
-                _delayCount ? _delaySum / _delayCount * 1000 : 0);
+                _delayCount ? _delaySum / _delayCount * 1000 : 0, _interpolated ? _coarseShare / _interpolated * 100 : 0);
     } else {
         @synchronized (_pending) { _shown = _missed = 0; }
     }
     _statsStart = received;
     _received = _unique = _interpolated = _scaled = _cuts = _holds = _skipped = _delayCount = 0;
-    _interpSum = _scaleSum = _delaySum = 0;
+    _interpSum = _scaleSum = _delaySum = _coarseShare = 0;
 }
 
 - (void)submit:(CVPixelBufferRef)frame {

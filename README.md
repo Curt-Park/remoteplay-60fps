@@ -38,6 +38,7 @@ Use a 1080p SDR stream. During a stream chiaki-ng's own menus are hidden under t
 | `SMOOTH_OFF=1` | Run as plain chiaki-ng |
 | `SMOOTH_SHARPEN=<n>` | Sharpen the middle frames. Off by default: it makes them differ from the real frames |
 | `SMOOTH_MAX_MOTION=<n>` | Show no middle frame when the picture changed by more than this (mean luma difference, 0–255). Fast turns then run at 30 fps instead of smearing; around 12–15 is where smearing starts |
+| `SMOOTH_COARSE_MOTION=<n>` | Picture change (mean luma difference) above which the second, half-size interpolation runs. Default 6; `0` runs it always, `255` never |
 | `SMOOTH_DEBUG=1` | Print a status line every two seconds |
 | `SMOOTH_DIFF=1` | Print how each decoded frame was classified |
 
@@ -60,9 +61,13 @@ Use a 1080p SDR stream. During a stream chiaki-ng's own menus are hidden under t
    next to the last real frame's difference.
 3. **Interpolate** the midpoint of the two 720p copies with `VTLowLatencyFrameInterpolation`. A scene
    cut gets no middle frame.
-4. **Upscale** the middle frame to 1080p with `VTLowLatencySuperResolutionScaler`.
-5. **Schedule** the middle frame and the untouched real frame for consecutive display refreshes.
-6. **Present** through a `CAMetalLayer` in a borderless child window over chiaki-ng's content, once
+4. **Interpolate again at half size when the picture moves a lot.** The same pair, shrunk to 640×360
+   in the corner of a 720p canvas, goes through a second interpolator session. Halving the picture
+   halves the motion in pixels, so the model follows moves it loses at full size. Where the two
+   results differ and the picture moved, the half-size result is used; elsewhere the sharper one.
+5. **Upscale** the middle frame to 1080p with `VTLowLatencySuperResolutionScaler`.
+6. **Schedule** the middle frame and the untouched real frame for consecutive display refreshes.
+7. **Present** through a `CAMetalLayer` in a borderless child window over chiaki-ng's content, once
    per refresh from a display link on its own thread.
 
 ## Measured on an M1 Mac mini (macOS 27, 60 Hz display, GTA 6 at 1080p)
@@ -70,6 +75,7 @@ Use a 1080p SDR stream. During a stream chiaki-ng's own menus are hidden under t
 | | |
 |---|---|
 | Interpolation at 1280×720 | 6–9 ms per frame |
+| With the half-size pass and merge (fast motion only) | about 14 ms per frame, still 59–60 on screen |
 | Interpolation at 1920×1080 | about 100 ms, not usable |
 | Upscale to 1080p | 3–6 ms per frame |
 | On screen | 59–60 picture changes per second, 96–99 % evenly spaced |
@@ -108,10 +114,12 @@ each. Starting the measurement disturbs the pipeline for a second or two.
 - **Do not sharpen middle frames.** A frame rebuilt from 720p is 0.9 luma levels from its native
   original unsharpened and 2.3 at sharpness 1.5; alternating with native frames, that shimmered.
 - **A commit needs about 12.5 ms** before a refresh to make it.
-- **Fast motion smears.** In a quick camera turn a foreground object moves about 100 px between two game
-  frames, and the interpolator returns a blur of both positions with the background behind it distorted.
-  Sizes just above 1280×720, where a more accurate model is reported to take over, are rejected on the M1;
-  1920×1080 uses it but takes 93 ms.
+- **Fast motion smears at full size.** In a quick camera turn a foreground object moves about 100 px
+  between two game frames, and the 720p interpolation returns a blur of both positions. Vertical
+  moves fail sooner than horizontal ones and leave horizontal streaks. The interpolator accepts only
+  1280×720 and 1920×1080 on the M1 (the more accurate 1080p model takes 93 ms), which is why the
+  half-size pass pads the shrunken picture into a 720p canvas. Its result is soft, so it is used
+  only where the full-size result is wrong.
 
 Tried and dropped on the M1:
 
