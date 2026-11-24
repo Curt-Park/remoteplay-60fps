@@ -33,6 +33,13 @@ file, no dependencies.
 The output window never becomes the active app, so the captured app keeps receiving keyboard and
 controller input, in full screen too.
 
+### Using it with a streaming client
+
+Any client works as the source. For PS5, [chiaki-ng](https://github.com/chiaki-ng/chiaki-ng) gives a
+sharper picture than the official Remote Play app because its bitrate can be raised. Set its frame
+rate to 30 so only real frames are sent, and keep its window around 1280×720 points: the picture is
+processed at 720p, and a larger window only costs GPU time that the interpolation needs.
+
 ### Options
 
 With no options it runs for the best picture: 1080p, sharpened, steadiest pacing, 50 ms behind the
@@ -123,6 +130,13 @@ Measured on an M1 Mac mini, macOS 27, 60 Hz display.
 ## Notes for anyone changing this
 
 Things that cost time to find:
+
+- **One slow frame must not shift the schedule.** The time allowed for an upscale is the slowest of
+  the last eight, capped at 30 ms, and a timeline that has fallen more than two steps behind is
+  restarted. An estimate that rose at once and fell slowly turned every hiccup into a second of
+  skipped middle frames.
+- **Warm up the models.** The first super-resolution call takes over 100 ms, so each model is run on
+  blank frames before capture starts.
 
 - **Display path.** `AVSampleBufferDisplayLayer` skipped refreshes whether fed by timestamps or
   display-immediately (about 39 distinct frames per second on screen). Setting `CALayer.contents`

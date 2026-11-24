@@ -107,6 +107,10 @@ static NSString *FourCC(OSType code) {
     int _scaled;
     dispatch_queue_t _upscaleQueue;   // real frames' upscaling, beside the capture queue
     double _frameUpscaleEstimate;     // guarded by @synchronized(_pending)
+    double _recentUpscales[8];
+    unsigned _recentUpscaleIndex;
+    int _resyncs, _lateShown;
+    BOOL _warmedUp;
     NSObject *_sharpenLock;
     CGWindowID _currentWindowID;
     BOOL _waitingReported;
@@ -279,6 +283,7 @@ static NSString *FourCC(OSType code) {
         if (chosen) { pixelFormat = chosen; _processorFormat = chosen; }
     }
     if (self.upscale) dispatch_sync(_queue, ^{ if (!self->_scaler) [self startScalerWidth:width height:height format:pixelFormat]; });
+    dispatch_sync(_queue, ^{ [self warmUpWidth:width height:height format:pixelFormat]; });
 
     SCStreamConfiguration *config = [SCStreamConfiguration new];
     config.width = width;
@@ -502,6 +507,28 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)attributes, &_scaledPool);
     _scaler = scaler;
     fprintf(stderr, "Super resolution x%.2f -> %ldx%ld\n", factor, (long)scaledWidth, (long)scaledHeight);
+}
+
+// The first call into each model takes 100 ms or more (measured 156 ms for super resolution). Paying that on
+// blank frames before capture starts keeps it out of the schedule of the first real frames.
+- (void)warmUpWidth:(NSInteger)width height:(NSInteger)height format:(OSType)format {
+    if (_warmedUp) return;
+    _warmedUp = YES;
+    NSDictionary *attributes = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}, (id)kCVPixelBufferMetalCompatibilityKey: @YES};
+    CVPixelBufferRef blankA = NULL, blankB = NULL;
+    CVPixelBufferCreate(NULL, width, height, format, (__bridge CFDictionaryRef)attributes, &blankA);
+    CVPixelBufferCreate(NULL, width, height, format, (__bridge CFDictionaryRef)attributes, &blankB);
+    if (blankA && blankB) {
+        for (int round = 0; round < 2; round++) {
+            if (_processor) [self interpolateFrom:blankA at:0 to:blankB at:1.0 / 30 phases:@[@0.5f] with:_processor];
+            CVPixelBufferRelease([self upscaled:blankB]);
+        }
+    }
+    CVPixelBufferRelease(blankA);
+    CVPixelBufferRelease(blankB);
+    _failed = 0;
+    _scaleSum = 0;
+    _scaled = 0;
 }
 
 // Returns a retained buffer: the super-resolved frame, or the input itself when scaling is off or fails.
@@ -771,7 +798,12 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         }
         // The callback for this frame's refresh already ran; there is still time to commit for it directly.
         BOOL inTime = !_slotFilled && target > _slotVsync - _period / 2 && _slotVsync - HostNow() > kCommitLead - 0.001;
-        if (!inTime) { _missed++; return; }
+        if (!inTime) {
+            // Too late for its own refresh. Showing it one refresh late beats dropping it, unless a newer frame is due then.
+            if (_pending.count == 0) { [_pending addObject:@[(__bridge id)buffer, @(_slotVsync + _period)]]; _lateShown++; }
+            else _missed++;
+            return;
+        }
         _slotFilled = YES;
         _shown++;
         _caught++;
@@ -951,7 +983,11 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         // Half the source interval in whole refreshes: one refresh at 60 Hz, two at 120 Hz.
         double step = MAX(1.0, round(_sourceInterval / 2 / period)) * period;
         double afterPrevious = _lastTarget + step;
-        double first = MAX(afterPrevious, refreshAtOrAfter(HostNow() + kCommitLead));
+        double earliest = refreshAtOrAfter(HostNow() + kCommitLead);
+        // After a stall the old timeline can sit far ahead of what is feasible now. Catching up by skipping
+        // middle frames takes a refresh per frame and shows nothing meanwhile, so the timeline restarts instead.
+        if (afterPrevious > earliest + 2 * step + period / 2) { afterPrevious = earliest; _resyncs++; }
+        double first = MAX(afterPrevious, earliest);
         if (middleOut) {
             BOOL behind = first > sourceRefresh + (1 + self.cushion) * step + period / 2;
             // A spare refresh of delay that has gone unused for 3 s is given back.
@@ -999,8 +1035,12 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
                 CVPixelBufferRef frameOut = [self upscaled:frame];
                 double took = HostNow() - begin;
                 @synchronized (self->_pending) {
-                    double current = self->_frameUpscaleEstimate;   // rises at once, falls slowly
-                    self->_frameUpscaleEstimate = took > current ? took : current + 0.05 * (took - current);
+                    // The slowest of the last eight, capped: a single hiccup is forgotten in a quarter of a second
+                    // and can never push the schedule back by more than two refreshes.
+                    self->_recentUpscales[self->_recentUpscaleIndex++ % 8] = took;
+                    double slowest = 0;
+                    for (int i = 0; i < 8; i++) slowest = MAX(slowest, self->_recentUpscales[i]);
+                    self->_frameUpscaleEstimate = MIN(slowest, 0.030);
                 }
                 [self show:frameOut target:target];
                 CVPixelBufferRelease(frameOut);
@@ -1031,8 +1071,9 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
                 _interpolated ? _interpSum / _interpolated * 1000 : 0, _interpMax * 1000,
                 scaled ? scaleSum / scaled * 1000 : 0,
                 _behindCount ? _behindSum / _behindCount * 1000 : 0);
-        if (self.debugDiff || getenv("SMOOTH_DEBUG")) fprintf(stderr, "sched: late commits %d, skipped middles %d, missed %d, rest frames %d, frame arrives %.1f ms after refresh\n",
-                caught, _trims, missed, _restShown, phase * 1000);
+        if (self.debugDiff || getenv("SMOOTH_DEBUG")) fprintf(stderr, "sched: late commits %d, skipped middles %d, missed %d, shown late %d, resyncs %d, rest frames %d, frame arrives %.1f ms after refresh\n",
+                caught, _trims, missed, _lateShown, _resyncs, _restShown, phase * 1000);
+        _lateShown = _resyncs = 0;
         _restShown = 0;
         _holds = _trims = _behindCount = 0;
         _behindSum = 0;
