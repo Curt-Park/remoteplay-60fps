@@ -31,7 +31,19 @@ chiaki-ng links OpenSSL 3 and would otherwise pick up the wrong headers.
 `run.sh` starts the built chiaki-ng with the Vulkan loader set; arguments are passed on. Without the
 loader chiaki-ng falls back to OpenGL, renders on the main thread, and the stream stutters badly.
 
-Use a 1080p SDR stream. During a stream chiaki-ng's own menus are hidden under the picture.
+Use an SDR stream at 1080p or 720p. During a stream chiaki-ng's own menus are hidden under the picture.
+
+- **1080p**: real frames are shown as decoded, middle frames are rebuilt from 720p. Sharpest, but
+  every other frame has a different quality.
+- **720p**: real and middle frames go through the same upscale to 1080p, so they match. Softer
+  overall. Raise the bitrate to the 1080p default so the smaller picture is compressed less:
+
+  ```sh
+  defaults write com.chiaki.Chiaki settings.resolution_local_ps5 -string 720p
+  defaults write com.chiaki.Chiaki settings.bitrate_local_ps5 -int 15000
+  ```
+
+  `defaults delete com.chiaki.Chiaki <key>` for both keys returns to 1080p.
 
 | Environment variable | Effect |
 |---|---|
@@ -58,7 +70,8 @@ Use a 1080p SDR stream. During a stream chiaki-ng's own menus are hidden under t
    next to the last real frame's difference.
 3. **Interpolate** the midpoint of the two 720p copies with `VTLowLatencyFrameInterpolation`. A scene
    cut gets no middle frame.
-4. **Upscale** the middle frame to 1080p with `VTLowLatencySuperResolutionScaler`.
+4. **Upscale** the middle frame to 1080p with `VTLowLatencySuperResolutionScaler`. With a 720p stream the
+   real frames are upscaled the same way.
 5. **Schedule** the middle frame and the untouched real frame for consecutive display refreshes.
 6. **Present** through a `CAMetalLayer` in a borderless child window over chiaki-ng's content, once
    per refresh from a display link on its own thread.
@@ -71,6 +84,7 @@ Use a 1080p SDR stream. During a stream chiaki-ng's own menus are hidden under t
 | Interpolation at 1920×1080 | about 100 ms, not usable |
 | Upscale to 1080p | 3–6 ms per frame |
 | On screen | 59–60 picture changes per second, 96–99 % evenly spaced |
+| 720p stream, every frame upscaled | 59–60 fps handed over, 55–59 measured on screen with 96 % evenly spaced |
 | Added delay | about 55–65 ms after a frame is decoded |
 
 Output is exactly twice the number of distinct frames the console sends. About 3 % of game frames
