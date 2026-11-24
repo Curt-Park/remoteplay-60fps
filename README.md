@@ -1,8 +1,8 @@
-# smooth-anything
+# remoteplay-60fps
 
 30 → 60 fps frame interpolation for PS5 Remote Play on macOS.
 
-Many PS5 games run at 30 fps, and some (GTA 6) have no 60 fps mode at all. smooth-anything is built
+Many PS5 games run at 30 fps, and some (GTA 6) have no 60 fps mode at all. remoteplay-60fps is built
 into [chiaki-ng](https://github.com/chiaki-ng/chiaki-ng), the open-source Remote Play client, and
 inserts a generated frame between every two game frames, so the game plays at 60 fps on a Mac. It
 uses only Apple frameworks (VideoToolbox, Metal, Core Animation).
