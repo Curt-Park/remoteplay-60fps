@@ -71,8 +71,12 @@ static NSString *FourCC(OSType code) {
 @implementation Smoother {
     SCStream *_stream;
     dispatch_queue_t _queue;
-    CALayer *_layer;
-    NSArray *_onScreen;
+    CAMetalLayer *_layer;
+    id<MTLDevice> _presentDevice;
+    id<MTLCommandQueue> _presentQueue;
+    id<MTLRenderPipelineState> _presentPipeline;
+    CVMetalTextureCacheRef _presentCache;
+    NSObject *_presentLock;
     VTFrameProcessor *_processor;
     CVPixelBufferPoolRef _pool;
     // Interpolating at a size other than the capture's: captures are scaled into _largePool, middles come out of
@@ -115,7 +119,8 @@ static NSString *FourCC(OSType code) {
     int _resyncs, _lateShown;
     BOOL _warmedUp;
     BOOL _outputHidden;   // main thread
-    NSView *_hostView;
+    NSWindow *_hostWindow;
+    NSPanel *_hostChild;
     VTPixelTransferSessionRef _submitTransfer;
     CVPixelBufferPoolRef _submitPool;
     NSObject *_sharpenLock;
@@ -152,6 +157,7 @@ static NSString *FourCC(OSType code) {
     _upscaleQueue = dispatch_queue_create("smooth-anything.upscale", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
     _frameUpscaleEstimate = 0.008;
     _sharpenLock = [NSObject new];
+    _presentLock = [NSObject new];
     _sourceInterval = 1.0 / 30.0;
     _pending = [NSMutableArray array];
     _period = 1.0 / 60.0;
@@ -659,8 +665,70 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     return output;
 }
 
-// Embedded: the picture goes into the host application's own window, above its content, so the host keeps its
-// window management, full screen and input handling. Events pass through to the host's view.
+// Frames are drawn into a Metal layer and presented from a thread of their own. Presents queue up and
+// reach the screen one per refresh in order, whatever else the application is doing. The earlier path,
+// setting a plain layer's contents, depended on commits from the main thread landing in the right
+// refresh: inside a Qt host about 40 % of frames never reached the screen (measured), and the same
+// commits made from another thread lost half of them even in the standalone tool.
+- (void)startOutputIn:(NSView *)view {
+    static NSString *const shader = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        "struct Out { float4 position [[position]]; float2 uv; };\n"
+        "vertex Out fullscreen(uint id [[vertex_id]]) {\n"
+        "    float2 p = float2((id << 1) & 2, id & 2);\n"
+        "    Out o; o.position = float4(p * 2.0 - 1.0, 0, 1); o.uv = float2(p.x, 1.0 - p.y); return o;\n"
+        "}\n"
+        "fragment float4 ycbcr(Out in [[stage_in]], texture2d<float> luma [[texture(0)]], texture2d<float> chroma [[texture(1)]],\n"
+        "                      constant float &fullRange [[buffer(0)]]) {\n"
+        "    constexpr sampler s(address::clamp_to_edge, filter::linear);\n"
+        "    float y = luma.sample(s, in.uv).r;\n"
+        "    float2 c = chroma.sample(s, in.uv).rg - 0.5;\n"
+        "    if (fullRange < 0.5) { y = (y - 16.0 / 255.0) * (255.0 / 219.0); c *= 255.0 / 224.0; }\n"
+        "    return float4(y + 1.5748 * c.y, y - 0.1873 * c.x - 0.4681 * c.y, y + 1.8556 * c.x, 1.0);\n"   // BT.709
+        "}\n";
+    _presentDevice = MTLCreateSystemDefaultDevice();
+    _presentQueue = [_presentDevice newCommandQueue];
+    NSError *error = nil;
+    id<MTLLibrary> library = [_presentDevice newLibraryWithSource:shader options:nil error:&error];
+    MTLRenderPipelineDescriptor *descriptor = [MTLRenderPipelineDescriptor new];
+    descriptor.vertexFunction = [library newFunctionWithName:@"fullscreen"];
+    descriptor.fragmentFunction = [library newFunctionWithName:@"ycbcr"];
+    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    _presentPipeline = library ? [_presentDevice newRenderPipelineStateWithDescriptor:descriptor error:&error] : nil;
+    if (!_presentPipeline) { fprintf(stderr, "Cannot set up the output: %s\n", error.localizedDescription.UTF8String); exit(1); }
+    CVMetalTextureCacheCreate(NULL, NULL, _presentDevice, NULL, &_presentCache);
+
+    _layer = [CAMetalLayer layer];
+    _layer.device = _presentDevice;
+    _layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    _layer.framebufferOnly = YES;
+    // Not synchronised to the display: a synchronised layer queues presents, and after one late frame the queue
+    // stayed full, so every present blocked for a refresh and the display callback fell behind (measured 36-42 ms).
+    // The display callback already presents once per refresh.
+    _layer.displaySyncEnabled = NO;
+    _layer.maximumDrawableCount = 3;
+    _layer.allowsNextDrawableTimeout = YES;
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceITUR_709);
+    _layer.colorspace = colorSpace;
+    CGColorSpaceRelease(colorSpace);
+    _layer.frame = view.bounds;
+    _layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+    _layer.contentsGravity = kCAGravityResizeAspect;
+    _layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+    _layer.drawableSize = CGSizeMake(kProcessWidth * 3 / 2, kProcessHeight * 3 / 2);
+    [view.layer addSublayer:_layer];
+
+    CADisplayLink *link = [view displayLinkWithTarget:self selector:@selector(refresh:)];
+    NSThread *thread = [[NSThread alloc] initWithBlock:^{
+        [link addToRunLoop:NSRunLoop.currentRunLoop forMode:NSDefaultRunLoopMode];
+        [NSRunLoop.currentRunLoop run];
+    }];
+    thread.name = @"smooth-anything.display";
+    thread.qualityOfService = NSQualityOfServiceUserInteractive;
+    [thread start];
+}
+
+// Embedded: the picture is laid over the content of the host application's own window, so the host keeps its
+// window management, full screen and input handling.
 - (void)attachToHostWindow {
     NSWindow *host = nil;
     for (NSWindow *window in NSApp.windows) {
@@ -671,23 +739,33 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [self attachToHostWindow]; });
         return;
     }
-    OutputView *view = [[OutputView alloc] initWithFrame:host.contentView.bounds];
+    // A borderless child window over the host's content rather than a view inside it: as a view above the
+    // host's own Metal layer only about 35 of every 60 presented frames reached the screen (measured).
+    NSRect content = [host convertRectToScreen:host.contentLayoutRect];
+    NSPanel *child = [[OutputPanel alloc] initWithContentRect:content styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+                                                      backing:NSBackingStoreBuffered defer:NO];
+    child.backgroundColor = NSColor.blackColor;
+    child.ignoresMouseEvents = YES;   // every event goes to the host's own view underneath
+    child.hasShadow = NO;
+    child.hidesOnDeactivate = NO;
+    child.releasedWhenClosed = NO;
+    OutputView *view = [[OutputView alloc] initWithFrame:NSMakeRect(0, 0, content.size.width, content.size.height)];
     view.passThrough = YES;
-    view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     view.wantsLayer = YES;
     view.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
-    [host.contentView addSubview:view positioned:NSWindowAbove relativeTo:nil];
-    _hostView = view;
-    view.hidden = _outputHidden;
-
-    _layer = [CALayer new];
-    _layer.frame = view.bounds;
-    _layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
-    _layer.contentsGravity = kCAGravityResizeAspect;
-    _layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
-    [view.layer addSublayer:_layer];
-    CADisplayLink *link = [view displayLinkWithTarget:self selector:@selector(refresh:)];
-    [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    child.contentView = view;
+    [host addChildWindow:child ordered:NSWindowAbove];
+    _hostWindow = host;
+    _hostChild = child;
+    if (_outputHidden) [child orderOut:nil];
+    // A child window follows its parent when it moves, but not when it is resized or changes screen.
+    for (NSNotificationName name in @[NSWindowDidResizeNotification, NSWindowDidEnterFullScreenNotification, NSWindowDidExitFullScreenNotification,
+                                      NSWindowDidChangeScreenNotification]) {
+        [NSNotificationCenter.defaultCenter addObserverForName:name object:host queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+            [child setFrame:[host convertRectToScreen:host.contentLayoutRect] display:YES];
+        }];
+    }
+    [self startOutputIn:view];
     fprintf(stderr, "smooth-anything: showing in the host window (%.0fx%.0f pt)\n", view.bounds.size.width, view.bounds.size.height);
 }
 
@@ -716,14 +794,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     view.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
     self.panel.contentView = view;
 
-    _layer = [CALayer new];
-    _layer.frame = view.bounds;
-    _layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
-    _layer.contentsGravity = kCAGravityResizeAspect;
-    _layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
-    [view.layer addSublayer:_layer];
-    CADisplayLink *link = [view displayLinkWithTarget:self selector:@selector(refresh:)];
-    [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    [self startOutputIn:view];
 
     [self.panel orderFrontRegardless];
     if (getenv("SMOOTH_FULLSCREEN")) [self toggleFullScreen];   // for automated tests; users double-click or press F
@@ -773,7 +844,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 
 - (void)hideOutput {
     _outputHidden = YES;
-    if (self.embedded) { _hostView.hidden = YES; return; }
+    if (self.embedded) { [_hostChild orderOut:nil]; return; }
     if (_fullScreen) [self toggleFullScreen];
     [self.panel orderOut:nil];
 }
@@ -781,7 +852,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 - (void)showOutputIfHidden {
     if (!_outputHidden) return;
     _outputHidden = NO;
-    if (self.embedded) { _hostView.hidden = NO; return; }
+    if (self.embedded) { if (_hostChild && !_hostChild.parentWindow) [_hostWindow addChildWindow:_hostChild ordered:NSWindowAbove]; [_hostChild orderFront:nil]; return; }
     [self.panel orderFrontRegardless];
 }
 
@@ -870,7 +941,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         _shown++;
         _caught++;
     }
-    dispatch_async(dispatch_get_main_queue(), ^{ [self present:item]; });
+    [self present:item];
 }
 
 - (void)refresh:(CADisplayLink *)link {
@@ -890,20 +961,46 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     if (next) [self present:next];
 }
 
-// Main thread. Setting the surface as layer contents commits it for the coming refresh.
-// The array keeps the pixel buffer, and with it the surface, alive while it is on screen.
+// Display thread, or the thread that just finished a frame in time for the current refresh.
+// Draws the frame into the next drawable and presents it; the system shows it at the coming refresh.
 - (void)present:(NSArray *)item {
-    double now = HostNow();
-    if (self.logStalls && _lastPresent > 0 && now - _lastPresent > 0.12 && now - _lastPresent < 3.0) {
-        fprintf(stderr, "output: nothing shown for %.0f ms\n", (now - _lastPresent) * 1000);
+    @synchronized (_presentLock) {
+        double now = HostNow();
+        if (self.logStalls && _lastPresent > 0 && now - _lastPresent > 0.12 && now - _lastPresent < 3.0) {
+            fprintf(stderr, "output: nothing shown for %.0f ms\n", (now - _lastPresent) * 1000);
+        }
+        _lastPresent = now;
+        CVPixelBufferRef buffer = (__bridge CVPixelBufferRef)item[0];
+        size_t width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer);
+        if (!CVPixelBufferIsPlanar(buffer)) return;
+        if (_layer.drawableSize.width != width || _layer.drawableSize.height != height) _layer.drawableSize = CGSizeMake(width, height);
+        CVMetalTextureRef luma = NULL, chroma = NULL;
+        CVMetalTextureCacheCreateTextureFromImage(NULL, _presentCache, buffer, NULL, MTLPixelFormatR8Unorm, width, height, 0, &luma);
+        CVMetalTextureCacheCreateTextureFromImage(NULL, _presentCache, buffer, NULL, MTLPixelFormatRG8Unorm, width / 2, height / 2, 1, &chroma);
+        id<CAMetalDrawable> drawable = (luma && chroma) ? [_layer nextDrawable] : nil;
+        if (drawable) {
+            MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.colorAttachments[0].texture = drawable.texture;
+            pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLCommandBuffer> commands = [_presentQueue commandBuffer];
+            id<MTLRenderCommandEncoder> encoder = [commands renderCommandEncoderWithDescriptor:pass];
+            float fullRange = CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ? 1 : 0;
+            [encoder setRenderPipelineState:_presentPipeline];
+            [encoder setFragmentTexture:CVMetalTextureGetTexture(luma) atIndex:0];
+            [encoder setFragmentTexture:CVMetalTextureGetTexture(chroma) atIndex:1];
+            [encoder setFragmentBytes:&fullRange length:sizeof(fullRange) atIndex:0];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [encoder endEncoding];
+            [commands presentDrawable:drawable];
+            // The frame and its textures must outlive the GPU's use of them.
+            [commands addCompletedHandler:^(id<MTLCommandBuffer> done) { (void)item; CFRelease(luma); CFRelease(chroma); }];
+            [commands commit];
+        } else {
+            if (luma) CFRelease(luma);
+            if (chroma) CFRelease(chroma);
+        }
     }
-    _lastPresent = now;
-    _onScreen = item;
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    _layer.contents = (__bridge id)CVPixelBufferGetIOSurface((__bridge CVPixelBufferRef)item[0]);
-    [CATransaction commit];
-    [CATransaction flush];
 }
 
 // Returns the frames at the given phases between the two inputs, oldest first, or nil on failure.

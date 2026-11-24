@@ -1,0 +1,68 @@
+diff --git a/gui/CMakeLists.txt b/gui/CMakeLists.txt
+index 7e777e1f..165eed30 100755
+--- a/gui/CMakeLists.txt
++++ b/gui/CMakeLists.txt
+@@ -142,6 +142,23 @@ if(APPLE)
+ 	target_link_libraries(chiaki "-framework AVFoundation" "-framework IOKit")
+ endif()
+ 
++# smooth-anything: decoded frames go to its interpolation pipeline and output window instead of the stream view.
++# Its source is compiled by hand: enabling the OBJC language here would change how this project's own .m file is built.
++if(APPLE AND SMOOTH_ANYTHING_DIR)
++	set(SMOOTH_OBJECT ${CMAKE_CURRENT_BINARY_DIR}/smooth_anything.o)
++	add_custom_command(OUTPUT ${SMOOTH_OBJECT}
++		COMMAND ${CMAKE_C_COMPILER} -x objective-c -fobjc-arc -O2 -DSMOOTH_EMBEDDED -mmacosx-version-min=26.0
++			-Wno-unguarded-availability-new -c ${SMOOTH_ANYTHING_DIR}/main.m -o ${SMOOTH_OBJECT}
++		DEPENDS ${SMOOTH_ANYTHING_DIR}/main.m ${SMOOTH_ANYTHING_DIR}/smooth.h
++		COMMENT "Compiling smooth-anything")
++	set_source_files_properties(${SMOOTH_OBJECT} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
++	target_sources(chiaki PRIVATE ${SMOOTH_OBJECT})
++	target_include_directories(chiaki PRIVATE ${SMOOTH_ANYTHING_DIR})
++	target_compile_definitions(chiaki PRIVATE CHIAKI_SMOOTH_ANYTHING)
++	target_link_libraries(chiaki "-framework ScreenCaptureKit" "-framework VideoToolbox" "-framework Metal"
++		"-framework CoreMedia" "-framework CoreVideo" "-framework QuartzCore" "-framework Cocoa")
++endif()
++
+ # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fanalyzer")
+ set_target_properties(chiaki PROPERTIES
+ 		MACOSX_BUNDLE TRUE
+diff --git a/gui/src/qmlbackend.cpp b/gui/src/qmlbackend.cpp
+index d188a790..a3145de7 100644
+--- a/gui/src/qmlbackend.cpp
++++ b/gui/src/qmlbackend.cpp
+@@ -34,6 +34,9 @@
+ #include <QTimer>
+ 
+ extern "C" {
++#ifdef CHIAKI_SMOOTH_ANYTHING
++#include "smooth.h"
++#endif
+ #include <chiaki/time.h>
+ #include <libavcodec/avcodec.h>
+ #include <libavutil/pixdesc.h>
+@@ -1135,6 +1138,15 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
+         if (frame.recovered)
+             pending_recovered_frame.storeRelaxed(1);
+ 
++#ifdef CHIAKI_SMOOTH_ANYTHING
++        // Hardware-decoded frames bypass the stream view: smooth-anything interpolates and shows them itself.
++        if (frame.frame->format == AV_PIX_FMT_VIDEOTOOLBOX && frame.frame->data[3] && !qEnvironmentVariableIsSet("SMOOTH_OFF")) {
++            SmoothSubmit(reinterpret_cast<CVPixelBufferRef>(frame.frame->data[3]));
++            av_frame_free(&frame.frame);
++            return;
++        }
++#endif
++
+         const qint64 prepare_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+         if (!prepareFrameForPresentation(frame, use_opengl_renderer))
+         {
+@@ -1163,6 +1175,9 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
+     connect(session, &StreamSession::SessionQuit, this, [this, session_for_connections](ChiakiQuitReason reason, const QString &reason_str) {
+         if (session != session_for_connections)
+             return;
++#ifdef CHIAKI_SMOOTH_ANYTHING
++        SmoothHide();
++#endif
+ 
+         if (chiaki_quit_reason_is_error(reason)) {
+             QString m = tr("Chiaki Session has quit") + ":\n" + chiaki_quit_reason_string(reason);

@@ -40,6 +40,23 @@ sharper picture than the official Remote Play app because its bitrate can be rai
 rate to 30 so only real frames are sent, and keep its window around 1280×720 points: the picture is
 processed at 720p, and a larger window only costs GPU time that the interpolation needs.
 
+### Without capture: inside chiaki-ng
+
+`chiaki/` builds chiaki-ng v1.10.1 with smooth-anything compiled in. Decoded frames go straight to the
+interpolator and the result is laid over chiaki-ng's own window, so nothing is captured and chiaki-ng
+does not render the video a second time. Real frames are shown as decoded (1080p); only the middle
+frames are rebuilt from a 720p copy.
+
+```sh
+git clone --recurse-submodules --branch v1.10.1 https://github.com/chiaki-ng/chiaki-ng
+chiaki/build.sh chiaki-ng          # applies chiaki/smooth-hook.patch and builds
+chiaki/run.sh chiaki-ng            # same settings and registered consoles as the installed chiaki-ng
+```
+
+`SMOOTH_OFF=1` runs it as plain chiaki-ng, `SMOOTH_NO_NATIVE=1` sends real frames through 720p as well,
+and `SMOOTH_SHARPEN=<n>` sets the sharpening of the middle frames. HDR streams are not supported.
+chiaki-ng is AGPL-3.0, so a binary built this way is covered by the AGPL.
+
 ### Options
 
 With no options it runs for the best picture: 1080p, sharpened, steadiest pacing, 50 ms behind the
@@ -141,9 +158,13 @@ Things that cost time to find:
 - **Warm up the models.** The first super-resolution call takes over 100 ms, so each model is run on
   blank frames before capture starts.
 
-- **Display path.** `AVSampleBufferDisplayLayer` skipped refreshes whether fed by timestamps or
-  display-immediately (about 39 distinct frames per second on screen). Setting `CALayer.contents`
-  from a `CADisplayLink` callback does not.
+- **Display path.** Frames are drawn into a `CAMetalLayer` (display sync off) and presented once per
+  refresh from a `CADisplayLink` on its own thread. What failed, measured on screen:
+  `AVSampleBufferDisplayLayer` (about 39 of 60 frames); `CALayer.contents` committed from a thread
+  other than the main one (half lost) or from the main thread of a busy host (40 % lost); a
+  display-synced Metal layer (presents queue up and block for a refresh after one late frame); a view
+  inside a host window that has its own Metal layer (35 of 60), which is why the embedded output is a
+  child window.
 - **Capture rate.** `SCStreamConfiguration.minimumFrameInterval = 1/60` loses about two refreshes
   per second. Use a smaller interval.
 - **Commit deadline.** A commit needs about 12.5 ms before a refresh to make it.
