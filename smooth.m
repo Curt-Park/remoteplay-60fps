@@ -7,6 +7,8 @@
 
 static const NSInteger kProcessWidth = 1280, kProcessHeight = 720;
 static const NSInteger kFullWidth = 1920, kFullHeight = 1080;
+// Warm-up calls run back to back, which an M2 Pro does in 14 ms against 20 ms at one call per frame.
+static const double kFullCallLimit = 0.025;
 static const OSType kProcessFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
 static const double kCommitLead = 0.013;
 static const double kRepeatRatio = 0.3;
@@ -86,7 +88,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     _sourceInterval = 1.0 / 30.0;
     _debug = getenv("SMOOTH_DEBUG") != NULL;
     _debugDiff = getenv("SMOOTH_DIFF") != NULL;
-    _wantFull = getenv("SMOOTH_INTERP_1080") != NULL;
+    _wantFull = getenv("SMOOTH_INTERP_720") == NULL;
     _device = MTLCreateSystemDefaultDevice();
     _commands = [_device newCommandQueue];
     CVMetalTextureCacheCreate(NULL, NULL, _device, NULL, &_textures);
@@ -94,38 +96,60 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     return self;
 }
 
+- (BOOL)startInterpolatorWidth:(NSInteger)width height:(NSInteger)height {
+    VTLowLatencyFrameInterpolationConfiguration *config =
+        [[VTLowLatencyFrameInterpolationConfiguration alloc] initWithFrameWidth:width frameHeight:height numberOfInterpolatedFrames:1];
+    VTFrameProcessor *processor = [VTFrameProcessor new];
+    NSError *error = nil;
+    if (!config || ![processor startSessionWithConfiguration:config error:&error]) {
+        fprintf(stderr, "smooth: interpolation at %ldx%ld unavailable: %s\n", (long)width, (long)height,
+                error ? error.description.UTF8String : "size rejected");
+        return NO;
+    }
+    _processor = processor;
+    _middlePool = NewPool(config.destinationPixelBufferAttributes, width, height);
+    // Built from the interpolator's own source attributes, which above 1280x720 can ask for padded buffers.
+    if (width != kProcessWidth) _fullPool = NewPool(config.sourcePixelBufferAttributes, width, height);
+    return YES;
+}
+
+- (void)stopInterpolator {
+    [_processor endSession];
+    _processor = nil;
+    CVPixelBufferPoolRelease(_middlePool);
+    _middlePool = NULL;
+    CVPixelBufferPoolRelease(_fullPool);
+    _fullPool = NULL;
+}
+
+// Runs a few calls on blank frames so the first real ones are not slow, and returns the fastest warm call in seconds.
+- (double)warmUp {
+    CVPixelBufferPoolRef inputPool = _fullPool ?: _smallPool;
+    CVPixelBufferRef blankA = NULL, blankB = NULL;
+    CVPixelBufferPoolCreatePixelBuffer(NULL, inputPool, &blankA);
+    CVPixelBufferPoolCreatePixelBuffer(NULL, inputPool, &blankB);
+    double fastest = 0;
+    for (int round = 0; round < 3 && blankA && blankB; round++) {
+        double begin = HostNow();
+        CVPixelBufferRef middle = [self interpolateFrom:blankA at:0 to:blankB at:1.0 / 30];
+        double took = HostNow() - begin;
+        if (round > 0 && (fastest == 0 || took < fastest)) fastest = took;
+        CVPixelBufferRef finished = [self finished:middle ?: blankB large:YES];
+        CVPixelBufferRelease(finished);
+        CVPixelBufferRelease(middle);
+    }
+    CVPixelBufferRelease(blankA);
+    CVPixelBufferRelease(blankB);
+    return fastest;
+}
+
 - (void)prepare {
     if (_prepared) return;
     _prepared = YES;
-    if (_wantFull) {
-        // Above 1280x720's pixels the interpolator switches to a slower network whose middle frames are closer to the real ones.
-        VTLowLatencyFrameInterpolationConfiguration *config =
-            [[VTLowLatencyFrameInterpolationConfiguration alloc] initWithFrameWidth:kFullWidth frameHeight:kFullHeight numberOfInterpolatedFrames:1];
-        VTFrameProcessor *processor = [VTFrameProcessor new];
-        NSError *error = nil;
-        if (config && [processor startSessionWithConfiguration:config error:&error]) {
-            _processor = processor;
-            _middlePool = NewPool(config.destinationPixelBufferAttributes, kFullWidth, kFullHeight);
-            // Built from the interpolator's own source attributes, which above 1280x720 can ask for padded buffers.
-            _fullPool = NewPool(config.sourcePixelBufferAttributes, kFullWidth, kFullHeight);
-        } else {
-            fprintf(stderr, "smooth: interpolation at %ldx%ld unavailable (%s), using %ldx%ld\n", (long)kFullWidth, (long)kFullHeight,
-                    error ? error.description.UTF8String : "size rejected", (long)kProcessWidth, (long)kProcessHeight);
-        }
-    }
-    if (!_processor && [VTLowLatencyFrameInterpolationConfiguration isSupported]) {
-        VTLowLatencyFrameInterpolationConfiguration *config =
-            [[VTLowLatencyFrameInterpolationConfiguration alloc] initWithFrameWidth:kProcessWidth frameHeight:kProcessHeight numberOfInterpolatedFrames:1];
-        VTFrameProcessor *processor = [VTFrameProcessor new];
-        NSError *error = nil;
-        if (config && [processor startSessionWithConfiguration:config error:&error]) {
-            _processor = processor;
-            _middlePool = NewPool(config.destinationPixelBufferAttributes, kProcessWidth, kProcessHeight);
-        } else {
-            fprintf(stderr, "smooth: interpolation unavailable: %s\n", error.description.UTF8String);
-        }
-    }
-    if (_debug) fprintf(stderr, "smooth: interpolating at %s\n", _fullPool ? "1920x1080" : "1280x720");
+    BOOL supported = [VTLowLatencyFrameInterpolationConfiguration isSupported];
+    // Above 1280x720's pixels the interpolator switches to a slower network whose middle frames are closer to the real ones.
+    if (supported && _wantFull) [self startInterpolatorWidth:kFullWidth height:kFullHeight];
+    if (supported && !_processor) [self startInterpolatorWidth:kProcessWidth height:kProcessHeight];
     if ([VTLowLatencySuperResolutionScalerConfiguration isSupported]) {
         NSArray<NSNumber *> *factors = [VTLowLatencySuperResolutionScalerConfiguration supportedScaleFactorsForFrameWidth:kProcessWidth frameHeight:kProcessHeight];
         if ([factors containsObject:@1.5f]) {
@@ -141,18 +165,15 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     VTPixelTransferSessionCreate(NULL, &_transfer);
     _smallPool = NewPool(nil, kProcessWidth, kProcessHeight);
 
-    CVPixelBufferPoolRef inputPool = _fullPool ?: _smallPool;
-    CVPixelBufferRef blankA = NULL, blankB = NULL;
-    CVPixelBufferPoolCreatePixelBuffer(NULL, inputPool, &blankA);
-    CVPixelBufferPoolCreatePixelBuffer(NULL, inputPool, &blankB);
-    for (int round = 0; round < 2 && blankA && blankB; round++) {
-        CVPixelBufferRef middle = [self interpolateFrom:blankA at:0 to:blankB at:1.0 / 30];
-        CVPixelBufferRef finished = [self finished:middle ?: blankB large:YES];
-        CVPixelBufferRelease(finished);
-        CVPixelBufferRelease(middle);
+    double call = [self warmUp];
+    // A slower Mac (an M1 takes about 100 ms at 1080p) would miss nearly every middle frame, so it keeps 1280x720.
+    if (_fullPool && call > kFullCallLimit) {
+        fprintf(stderr, "smooth: interpolation at 1920x1080 takes %.0f ms on this Mac, using 1280x720\n", call * 1000);
+        [self stopInterpolator];
+        if (supported) [self startInterpolatorWidth:kProcessWidth height:kProcessHeight];
+        call = [self warmUp];
     }
-    CVPixelBufferRelease(blankA);
-    CVPixelBufferRelease(blankB);
+    if (_debug) fprintf(stderr, "smooth: interpolating at %s, %.1f ms a call\n", _fullPool ? "1920x1080" : "1280x720", call * 1000);
     _failed = 0;
     _scaleSum = 0;
     _scaled = 0;

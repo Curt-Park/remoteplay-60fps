@@ -36,7 +36,7 @@ Use a 1080p SDR stream. During a stream chiaki-ng's own menus are hidden under t
 | Environment variable | Effect |
 |---|---|
 | `SMOOTH_OFF=1` | Run as plain chiaki-ng |
-| `SMOOTH_INTERP_1080=1` | Interpolate at 1920×1080 instead of 1280×720. The interpolator then runs a slower, more accurate network, and the middle frame needs no upscale. Needs an M2 Pro or faster: about 20 ms a call there, about 100 ms on an M1 |
+| `SMOOTH_INTERP_720=1` | Interpolate at 1280×720 even on a Mac fast enough for 1920×1080 |
 | `SMOOTH_DEBUG=1` | Print a status line every two seconds |
 | `SMOOTH_DIFF=1` | Print how each decoded frame was classified |
 
@@ -53,14 +53,15 @@ Use a 1080p SDR stream. During a stream chiaki-ng's own menus are hidden under t
 ## How it works
 
 1. **Take the frame.** chiaki-ng's hardware-decoded frame goes to `SmoothSubmit` instead of its
-   stream view. A 720p copy is made for processing.
+   stream view. A 720p copy is made to find repeats, and a 1080p copy for interpolation.
 2. **Drop repeats.** A 60 fps stream of a 30 fps game carries every game frame twice, the second
    time as a faint re-encode. A frame is a repeat when its difference from the previous one is small
    next to the last real frame's difference.
-3. **Interpolate** the midpoint of the two 720p copies with `VTLowLatencyFrameInterpolation`, or of
-   two 1080p copies with `SMOOTH_INTERP_1080`. A scene cut gets no middle frame.
-4. **Upscale** the middle frame to 1080p with `VTLowLatencySuperResolutionScaler`, unless it was
-   interpolated at 1080p.
+3. **Interpolate** the midpoint of the two 1080p copies with `VTLowLatencyFrameInterpolation`. Above
+   1280×720 it runs a slower, more accurate network. Before the first frame a few warm-up calls are
+   timed, and a Mac that needs more than 25 ms a call (an M1 takes about 100 ms) interpolates the
+   720p copies instead. A scene cut gets no middle frame.
+4. **Upscale** a 720p middle frame to 1080p with `VTLowLatencySuperResolutionScaler`.
 5. **Schedule** the middle frame and the untouched real frame for consecutive display refreshes.
 6. **Present** through a `CAMetalLayer` in a borderless child window over chiaki-ng's content, once
    per refresh from a display link on its own thread.
@@ -78,9 +79,9 @@ Use a 1080p SDR stream. During a stream chiaki-ng's own menus are hidden under t
 Output is exactly twice the number of distinct frames the console sends. About 3 % of game frames
 arrive held for three refreshes instead of two; each of those costs one held refresh.
 
-With `SMOOTH_INTERP_1080=1` on an M2 Pro (synthetic 1080p frames at 30 fps), interpolation took about
-20 ms a call instead of 12 ms plus a 6 ms upscale, output stayed at 57–59 fps, and the delay grew by
-about 10 ms.
+The M1 therefore interpolates at 720p. On an M2 Pro (synthetic 1080p frames at 30 fps), 1080p
+interpolation took about 20 ms a call (14 ms in the back-to-back warm-up) instead of 12 ms plus a
+6 ms upscale at 720p, output stayed at 57–60 fps, and the delay grew by about 5–10 ms.
 
 ### Checking the result
 
