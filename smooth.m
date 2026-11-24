@@ -47,11 +47,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     id<MTLDevice> _device;
     id<MTLCommandQueue> _commands;
     CVMetalTextureCacheRef _textures, _presentTextures;
-    id<MTLRenderPipelineState> _presentPipeline, _blendPipeline;
-    float _blend;
-    id<MTLTexture> _history[2];
-    int _historyIndex;
-    BOOL _historyValid;
+    id<MTLRenderPipelineState> _presentPipeline;
     CAMetalLayer *_layer;
     NSObject *_presentLock;
 
@@ -91,7 +87,6 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     _debug = getenv("SMOOTH_DEBUG") != NULL;
     _debugDiff = getenv("SMOOTH_DIFF") != NULL;
     _wantFull = getenv("SMOOTH_INTERP_1080") != NULL;
-    _blend = getenv("SMOOTH_BLEND") ? (float)fmin(fmax(atof(getenv("SMOOTH_BLEND")), 0), 0.9) : 0;
     _device = MTLCreateSystemDefaultDevice();
     _commands = [_device newCommandQueue];
     CVMetalTextureCacheCreate(NULL, NULL, _device, NULL, &_textures);
@@ -250,25 +245,13 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         "    float2 p = float2((id << 1) & 2, id & 2);\n"
         "    Out o; o.position = float4(p * 2.0 - 1.0, 0, 1); o.uv = float2(p.x, 1.0 - p.y); return o;\n"
         "}\n"
-        "static float4 rgb(float2 uv, texture2d<float> luma, texture2d<float> chroma, float fullRange) {\n"
-        "    constexpr sampler s(address::clamp_to_edge, filter::linear);\n"
-        "    float y = luma.sample(s, uv).r;\n"
-        "    float2 c = chroma.sample(s, uv).rg - 0.5;\n"
-        "    if (fullRange < 0.5) { y = (y - 16.0 / 255.0) * (255.0 / 219.0); c *= 255.0 / 224.0; }\n"
-        "    return float4(y + 1.5748 * c.y, y - 0.1873 * c.x - 0.4681 * c.y, y + 1.8556 * c.x, 1.0);\n"
-        "}\n"
         "fragment float4 ycbcr(Out in [[stage_in]], texture2d<float> luma [[texture(0)]], texture2d<float> chroma [[texture(1)]],\n"
         "                      constant float &fullRange [[buffer(0)]]) {\n"
-        "    return rgb(in.uv, luma, chroma, fullRange);\n"
-        "}\n"
-        "struct Blended { float4 screen [[color(0)]]; float4 history [[color(1)]]; };\n"
-        "fragment Blended blended(Out in [[stage_in]], texture2d<float> luma [[texture(0)]], texture2d<float> chroma [[texture(1)]],\n"
-        "                         texture2d<float> previous [[texture(2)]], constant float &fullRange [[buffer(0)]],\n"
-        "                         constant float &amount [[buffer(1)]]) {\n"
-        "    float4 mixed = rgb(in.uv, luma, chroma, fullRange);\n"
-        "    // A fresh history texture holds garbage, and NaN * 0 is still NaN, so it is not read at all then.\n"
-        "    if (amount > 0.0) mixed = float4(mix(mixed.rgb, previous.read(uint2(in.position.xy)).rgb, amount), 1.0);\n"
-        "    Blended out; out.screen = mixed; out.history = mixed; return out;\n"
+        "    constexpr sampler s(address::clamp_to_edge, filter::linear);\n"
+        "    float y = luma.sample(s, in.uv).r;\n"
+        "    float2 c = chroma.sample(s, in.uv).rg - 0.5;\n"
+        "    if (fullRange < 0.5) { y = (y - 16.0 / 255.0) * (255.0 / 219.0); c *= 255.0 / 224.0; }\n"
+        "    return float4(y + 1.5748 * c.y, y - 0.1873 * c.x - 0.4681 * c.y, y + 1.8556 * c.x, 1.0);\n"
         "}\n";
     NSError *error = nil;
     id<MTLLibrary> library = [_device newLibraryWithSource:shader options:nil error:&error];
@@ -278,13 +261,6 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     _presentPipeline = library ? [_device newRenderPipelineStateWithDescriptor:descriptor error:&error] : nil;
     if (!_presentPipeline) { fprintf(stderr, "smooth: cannot set up the output: %s\n", error.localizedDescription.UTF8String); return; }
-    if (_blend > 0) {
-        descriptor.fragmentFunction = [library newFunctionWithName:@"blended"];
-        // The blended picture is also kept in half floats, so repeated mixing does not band.
-        descriptor.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA16Float;
-        _blendPipeline = [_device newRenderPipelineStateWithDescriptor:descriptor error:&error];
-        if (!_blendPipeline) fprintf(stderr, "smooth: blending unavailable: %s\n", error.localizedDescription.UTF8String);
-    }
 
     CAMetalLayer *layer = [CAMetalLayer layer];
     layer.device = _device;
@@ -316,7 +292,6 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 
 - (void)hide {
     _hidden = YES;
-    @synchronized (_presentLock) { _historyValid = NO; }
     [_child orderOut:nil];
 }
 
@@ -365,8 +340,8 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     return duplicate;
 }
 
-- (void)show:(CVPixelBufferRef)buffer target:(double)target reset:(BOOL)reset {
-    NSArray *item = @[(__bridge id)buffer, @(target), @(reset)];
+- (void)show:(CVPixelBufferRef)buffer target:(double)target {
+    NSArray *item = @[(__bridge id)buffer, @(target)];
     @synchronized (_pending) {
         if (target > _slotVsync + _period / 2) {
             NSUInteger index = _pending.count;
@@ -377,7 +352,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         }
         BOOL inTime = !_slotFilled && target > _slotVsync - _period / 2 && _slotVsync - HostNow() > kCommitLead - 0.001;
         if (!inTime) {
-            if (_pending.count == 0) [_pending addObject:@[(__bridge id)buffer, @(_slotVsync + _period), @(reset)]];
+            if (_pending.count == 0) [_pending addObject:@[(__bridge id)buffer, @(_slotVsync + _period)]];
             else _missed++;
             return;
         }
@@ -424,36 +399,13 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         pass.colorAttachments[0].texture = drawable.texture;
         pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-        float amount = 0;
-        if (_blendPipeline) {
-            if (!_history[0] || _history[0].width != width || _history[0].height != height) {
-                MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
-                                                                                                      width:width height:height mipmapped:NO];
-                descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-                descriptor.storageMode = MTLStorageModePrivate;
-                _history[0] = [_device newTextureWithDescriptor:descriptor];
-                _history[1] = [_device newTextureWithDescriptor:descriptor];
-                _historyValid = NO;
-            }
-            // A scene cut starts a fresh picture, so the previous scene does not show through it.
-            amount = (_historyValid && ![item[2] boolValue]) ? _blend : 0;
-            pass.colorAttachments[1].texture = _history[_historyIndex ^ 1];
-            pass.colorAttachments[1].loadAction = MTLLoadActionDontCare;
-            pass.colorAttachments[1].storeAction = MTLStoreActionStore;
-        }
         id<MTLCommandBuffer> commands = [_commands commandBuffer];
         id<MTLRenderCommandEncoder> encoder = [commands renderCommandEncoderWithDescriptor:pass];
         float fullRange = CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ? 1 : 0;
-        [encoder setRenderPipelineState:_blendPipeline ?: _presentPipeline];
+        [encoder setRenderPipelineState:_presentPipeline];
         [encoder setFragmentTexture:CVMetalTextureGetTexture(luma) atIndex:0];
         [encoder setFragmentTexture:CVMetalTextureGetTexture(chroma) atIndex:1];
         [encoder setFragmentBytes:&fullRange length:sizeof(fullRange) atIndex:0];
-        if (_blendPipeline) {
-            [encoder setFragmentTexture:_history[_historyIndex] atIndex:2];
-            [encoder setFragmentBytes:&amount length:sizeof(amount) atIndex:1];
-            _historyIndex ^= 1;
-            _historyValid = YES;
-        }
         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [encoder endEncoding];
         [commands presentDrawable:drawable];
@@ -471,7 +423,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 - (void)showRest {
     if (!_restFrame) return;
     double target = MAX(_lastTarget + _period, [self refreshAtOrAfter:HostNow() + kCommitLead]);
-    [self show:_restNative target:target reset:NO];
+    [self show:_restNative target:target];
     _lastTarget = target;
     CVPixelBufferRelease(_previousFrame);
     _previousFrame = _restFrame;
@@ -530,12 +482,12 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         }
         if (_lastTarget > 0 && gap < 0.100 && first > afterPrevious + period / 2) _holds += (int)llround((first - afterPrevious) / step);
         if (middleOut) {
-            [self show:middleOut target:first reset:NO];
+            [self show:middleOut target:first];
             CVPixelBufferRelease(middleOut);
             first += step;
         }
         first = MAX(first, [self refreshAtOrAfter:HostNow() + kCommitLead]);
-        [self show:native target:first reset:_sceneCut];
+        [self show:native target:first];
         _lastTarget = first;
         _delaySum += first - received;
         _delayCount++;

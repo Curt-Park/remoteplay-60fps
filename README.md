@@ -36,7 +36,6 @@ Use a 1080p SDR stream. During a stream chiaki-ng's own menus are hidden under t
 | Environment variable | Effect |
 |---|---|
 | `SMOOTH_OFF=1` | Run as plain chiaki-ng |
-| `SMOOTH_BLEND=<0–0.9>` | Keep this share of the previous picture in each new one, as a slow panel does. Middle frames go wrong in fast motion; a MacBook's mini-LED panel smears that away, a fast IPS monitor shows it. Blending hides it there at the cost of some motion blur; try 0.3–0.5. A scene cut starts a fresh picture |
 | `SMOOTH_INTERP_1080=1` | Interpolate at 1920×1080 instead of 1280×720. The interpolator then runs a slower, more accurate network, and the middle frame needs no upscale. Needs an M2 Pro or faster: about 20 ms a call there, about 100 ms on an M1 |
 | `SMOOTH_DEBUG=1` | Print a status line every two seconds |
 | `SMOOTH_DIFF=1` | Print how each decoded frame was classified |
@@ -64,8 +63,7 @@ Use a 1080p SDR stream. During a stream chiaki-ng's own menus are hidden under t
    interpolated at 1080p.
 5. **Schedule** the middle frame and the untouched real frame for consecutive display refreshes.
 6. **Present** through a `CAMetalLayer` in a borderless child window over chiaki-ng's content, once
-   per refresh from a display link on its own thread. With `SMOOTH_BLEND` each picture is mixed with
-   the previous one on the way.
+   per refresh from a display link on its own thread.
 
 ## Measured on an M1 Mac mini (macOS 27, 60 Hz display, GTA 6 at 1080p)
 
@@ -130,6 +128,7 @@ Tried and dropped on the M1:
 | Showing no middle frame when the picture changed a lot | Removes the smear but those moments run at 30 fps |
 | A 720p stream with real and middle frames through the same upscale, so their quality matches | 60 fps kept, but no visible improvement: the distortion comes from fast motion, not from the quality difference |
 | Showing real frames through 720p as well | Softer and slower (about 38 fps) |
+| Mixing each picture with the previous one, as a slow panel does, so a fast IPS monitor would hide the middle frames' errors like a MacBook's mini-LED panel (tried on an M2 Pro with a BenQ IPS monitor) | No visible improvement on the IPS monitor |
 
 Earlier versions captured a window with ScreenCaptureKit instead of taking frames from chiaki-ng.
 That worked on any app but paid for a second render and a capture; it is in the history before this
