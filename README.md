@@ -88,6 +88,9 @@ display rate and reports how often the picture really changes:
 | True 60 fps | 57–60 | 90–100 % |
 | 30 fps | about 30 | under 15 % |
 
+It also prints how many refreshes each picture stayed up. An evenly paced 30 fps source is nearly
+all 2s; many 1s and 3s mean uneven pacing, and 4 or more is a visible hitch.
+
 `--match pid:<n>` selects one process when several instances are running.
 
 ## How it works

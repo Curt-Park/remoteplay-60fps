@@ -116,6 +116,19 @@
     printf("%s: measured %.1f s at the display rate\n", self.match.UTF8String, duration);
     printf("  refreshes showing new motion: %.1f per second\n", moved / duration);
     printf("  motion split evenly across both refreshes of a pair: %.0f%% of pairs\n", pairs ? 100.0 * evenPairs / pairs : 0);
+    // How many refreshes each picture stayed up. An even 30 fps source is all 2s; 1s and 3s are uneven pacing,
+    // and anything longer is a visible hitch.
+    NSUInteger held[6] = {0}, run = 0, pictures = 0;
+    for (NSUInteger i = 0; i < refreshes; i++) {
+        BOOL changed = _differences[i].doubleValue >= threshold;
+        if (changed && run > 0) { held[MIN(run, (NSUInteger)5)]++; pictures++; }
+        run = changed ? 1 : (run > 0 ? run + 1 : 0);
+    }
+    printf("  refreshes each picture stayed up:");
+    for (NSUInteger length = 1; length <= 5; length++) {
+        printf(" %lu%s: %.0f%%", (unsigned long)length, length == 5 ? "+" : "", pictures ? 100.0 * held[length] / pictures : 0);
+    }
+    printf("\n");
     printf("  first 40 refresh differences:");
     for (NSUInteger i = 0; i < 40 && i < refreshes; i++) printf(" %.1f", _differences[i].doubleValue);
     printf("\n");
