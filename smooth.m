@@ -6,6 +6,7 @@
 #import "smooth.h"
 
 static const NSInteger kProcessWidth = 1280, kProcessHeight = 720;
+static const NSInteger kFullWidth = 1920, kFullHeight = 1080;
 static const OSType kProcessFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
 static const double kCommitLead = 0.013;
 static const double kRepeatRatio = 0.3;
@@ -32,11 +33,12 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 
 @implementation Smoother {
     dispatch_queue_t _queue;
-    BOOL _debug, _debugDiff, _prepared;
+    BOOL _debug, _debugDiff, _prepared, _wantFull;
     int _failed;
 
     VTFrameProcessor *_processor;
     CVPixelBufferPoolRef _middlePool;
+    CVPixelBufferPoolRef _fullPool;
     VTFrameProcessor *_scaler;
     CVPixelBufferPoolRef _scaledPool;
     VTPixelTransferSessionRef _transfer;
@@ -84,6 +86,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     _sourceInterval = 1.0 / 30.0;
     _debug = getenv("SMOOTH_DEBUG") != NULL;
     _debugDiff = getenv("SMOOTH_DIFF") != NULL;
+    _wantFull = getenv("SMOOTH_INTERP_1080") != NULL;
     _device = MTLCreateSystemDefaultDevice();
     _commands = [_device newCommandQueue];
     CVMetalTextureCacheCreate(NULL, NULL, _device, NULL, &_textures);
@@ -94,7 +97,23 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 - (void)prepare {
     if (_prepared) return;
     _prepared = YES;
-    if ([VTLowLatencyFrameInterpolationConfiguration isSupported]) {
+    if (_wantFull) {
+        // Above 1280x720's pixels the interpolator switches to a slower network whose middle frames are closer to the real ones.
+        VTLowLatencyFrameInterpolationConfiguration *config =
+            [[VTLowLatencyFrameInterpolationConfiguration alloc] initWithFrameWidth:kFullWidth frameHeight:kFullHeight numberOfInterpolatedFrames:1];
+        VTFrameProcessor *processor = [VTFrameProcessor new];
+        NSError *error = nil;
+        if (config && [processor startSessionWithConfiguration:config error:&error]) {
+            _processor = processor;
+            _middlePool = NewPool(config.destinationPixelBufferAttributes, kFullWidth, kFullHeight);
+            // Built from the interpolator's own source attributes, which above 1280x720 can ask for padded buffers.
+            _fullPool = NewPool(config.sourcePixelBufferAttributes, kFullWidth, kFullHeight);
+        } else {
+            fprintf(stderr, "smooth: interpolation at %ldx%ld unavailable (%s), using %ldx%ld\n", (long)kFullWidth, (long)kFullHeight,
+                    error ? error.description.UTF8String : "size rejected", (long)kProcessWidth, (long)kProcessHeight);
+        }
+    }
+    if (!_processor && [VTLowLatencyFrameInterpolationConfiguration isSupported]) {
         VTLowLatencyFrameInterpolationConfiguration *config =
             [[VTLowLatencyFrameInterpolationConfiguration alloc] initWithFrameWidth:kProcessWidth frameHeight:kProcessHeight numberOfInterpolatedFrames:1];
         VTFrameProcessor *processor = [VTFrameProcessor new];
@@ -106,6 +125,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
             fprintf(stderr, "smooth: interpolation unavailable: %s\n", error.description.UTF8String);
         }
     }
+    if (_debug) fprintf(stderr, "smooth: interpolating at %s\n", _fullPool ? "1920x1080" : "1280x720");
     if ([VTLowLatencySuperResolutionScalerConfiguration isSupported]) {
         NSArray<NSNumber *> *factors = [VTLowLatencySuperResolutionScalerConfiguration supportedScaleFactorsForFrameWidth:kProcessWidth frameHeight:kProcessHeight];
         if ([factors containsObject:@1.5f]) {
@@ -121,9 +141,10 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     VTPixelTransferSessionCreate(NULL, &_transfer);
     _smallPool = NewPool(nil, kProcessWidth, kProcessHeight);
 
+    CVPixelBufferPoolRef inputPool = _fullPool ?: _smallPool;
     CVPixelBufferRef blankA = NULL, blankB = NULL;
-    CVPixelBufferPoolCreatePixelBuffer(NULL, _smallPool, &blankA);
-    CVPixelBufferPoolCreatePixelBuffer(NULL, _smallPool, &blankB);
+    CVPixelBufferPoolCreatePixelBuffer(NULL, inputPool, &blankA);
+    CVPixelBufferPoolCreatePixelBuffer(NULL, inputPool, &blankB);
     for (int round = 0; round < 2 && blankA && blankB; round++) {
         CVPixelBufferRef middle = [self interpolateFrom:blankA at:0 to:blankB at:1.0 / 30];
         CVPixelBufferRef finished = [self finished:middle ?: blankB large:YES];
@@ -161,7 +182,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 - (CVPixelBufferRef)finished:(CVPixelBufferRef)buffer large:(BOOL)large {
     double begin = HostNow();
     CVPixelBufferRef result = CVPixelBufferRetain(buffer);
-    if (large && _scaler) {
+    if (large && _scaler && CVPixelBufferGetWidth(buffer) == (size_t)kProcessWidth) {
         CVPixelBufferRef destination = NULL;
         CVPixelBufferPoolCreatePixelBuffer(NULL, _scaledPool, &destination);
         if (destination) {
@@ -412,7 +433,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     _restNative = NULL;
 }
 
-- (void)handle:(CVPixelBufferRef)native small:(CVPixelBufferRef)small received:(double)received {
+- (void)handle:(CVPixelBufferRef)native small:(CVPixelBufferRef)small input:(CVPixelBufferRef)input received:(double)received {
     if (_statsStart == 0) _statsStart = received;
     _received++;
     NSUInteger generation = ++_generation;
@@ -422,7 +443,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     _restNative = NULL;
 
     if ([self isDuplicate:small]) {
-        _restFrame = CVPixelBufferRetain(small);
+        _restFrame = CVPixelBufferRetain(input);
         _restNative = CVPixelBufferRetain(native);
         _restTime = received;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)), _queue, ^{
@@ -439,7 +460,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         CVPixelBufferRef middleOut = NULL;
         if (_previousFrame && gap < 0.100 && !_sceneCut) {
             double begin = HostNow();
-            CVPixelBufferRef middle = [self interpolateFrom:_previousFrame at:_previousTime to:small at:received];
+            CVPixelBufferRef middle = [self interpolateFrom:_previousFrame at:_previousTime to:input at:received];
             _interpSum += HostNow() - begin;
             if (middle) {
                 _interpolated++;
@@ -471,7 +492,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         _delaySum += first - received;
         _delayCount++;
         CVPixelBufferRelease(_previousFrame);
-        _previousFrame = CVPixelBufferRetain(small);
+        _previousFrame = CVPixelBufferRetain(input);
         _previousTime = received;
     }
 
@@ -513,7 +534,14 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
             CVPixelBufferPoolCreatePixelBuffer(NULL, self->_smallPool, &small);
             if (small && VTPixelTransferSessionTransferImage(self->_transfer, frame, small) != noErr) { CVPixelBufferRelease(small); small = NULL; }
         }
-        if (small) [self handle:(showable ? frame : small) small:small received:received];
+        CVPixelBufferRef full = NULL;
+        if (small && self->_fullPool) {
+            CVPixelBufferPoolCreatePixelBuffer(NULL, self->_fullPool, &full);
+            if (full) CVBufferPropagateAttachments(frame, full);
+            if (full && VTPixelTransferSessionTransferImage(self->_transfer, frame, full) != noErr) { CVPixelBufferRelease(full); full = NULL; }
+        }
+        if (small) [self handle:(showable ? frame : small) small:small input:(full ?: small) received:received];
+        CVPixelBufferRelease(full);
         CVPixelBufferRelease(small);
         CVPixelBufferRelease(frame);
     });

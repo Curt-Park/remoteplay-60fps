@@ -36,6 +36,7 @@ Use a 1080p SDR stream. During a stream chiaki-ng's own menus are hidden under t
 | Environment variable | Effect |
 |---|---|
 | `SMOOTH_OFF=1` | Run as plain chiaki-ng |
+| `SMOOTH_INTERP_1080=1` | Interpolate at 1920×1080 instead of 1280×720. The interpolator then runs a slower, more accurate network, and the middle frame needs no upscale. Needs an M2 Pro or faster: about 20 ms a call there, about 100 ms on an M1 |
 | `SMOOTH_DEBUG=1` | Print a status line every two seconds |
 | `SMOOTH_DIFF=1` | Print how each decoded frame was classified |
 
@@ -56,9 +57,10 @@ Use a 1080p SDR stream. During a stream chiaki-ng's own menus are hidden under t
 2. **Drop repeats.** A 60 fps stream of a 30 fps game carries every game frame twice, the second
    time as a faint re-encode. A frame is a repeat when its difference from the previous one is small
    next to the last real frame's difference.
-3. **Interpolate** the midpoint of the two 720p copies with `VTLowLatencyFrameInterpolation`. A scene
-   cut gets no middle frame.
-4. **Upscale** the middle frame to 1080p with `VTLowLatencySuperResolutionScaler`.
+3. **Interpolate** the midpoint of the two 720p copies with `VTLowLatencyFrameInterpolation`, or of
+   two 1080p copies with `SMOOTH_INTERP_1080`. A scene cut gets no middle frame.
+4. **Upscale** the middle frame to 1080p with `VTLowLatencySuperResolutionScaler`, unless it was
+   interpolated at 1080p.
 5. **Schedule** the middle frame and the untouched real frame for consecutive display refreshes.
 6. **Present** through a `CAMetalLayer` in a borderless child window over chiaki-ng's content, once
    per refresh from a display link on its own thread.
@@ -75,6 +77,10 @@ Use a 1080p SDR stream. During a stream chiaki-ng's own menus are hidden under t
 
 Output is exactly twice the number of distinct frames the console sends. About 3 % of game frames
 arrive held for three refreshes instead of two; each of those costs one held refresh.
+
+With `SMOOTH_INTERP_1080=1` on an M2 Pro (synthetic 1080p frames at 30 fps), interpolation took about
+20 ms a call instead of 12 ms plus a 6 ms upscale, output stayed at 57–59 fps, and the delay grew by
+about 10 ms.
 
 ### Checking the result
 
