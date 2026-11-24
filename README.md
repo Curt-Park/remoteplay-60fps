@@ -37,6 +37,7 @@ Use a 1080p SDR stream. During a stream chiaki-ng's own menus are hidden under t
 |---|---|
 | `SMOOTH_OFF=1` | Run as plain chiaki-ng |
 | `SMOOTH_SHARPEN=<n>` | Sharpen the middle frames. Off by default: it makes them differ from the real frames |
+| `SMOOTH_MAX_MOTION=<n>` | Show no middle frame when the picture changed by more than this (mean luma difference, 0–255). Fast turns then run at 30 fps instead of smearing; around 12–15 is where smearing starts |
 | `SMOOTH_DEBUG=1` | Print a status line every two seconds |
 | `SMOOTH_DIFF=1` | Print how each decoded frame was classified |
 
@@ -107,6 +108,10 @@ each. Starting the measurement disturbs the pipeline for a second or two.
 - **Do not sharpen middle frames.** A frame rebuilt from 720p is 0.9 luma levels from its native
   original unsharpened and 2.3 at sharpness 1.5; alternating with native frames, that shimmered.
 - **A commit needs about 12.5 ms** before a refresh to make it.
+- **Fast motion smears.** In a quick camera turn a foreground object moves about 100 px between two game
+  frames, and the interpolator returns a blur of both positions with the background behind it distorted.
+  Sizes just above 1280×720, where a more accurate model is reported to take over, are rejected on the M1;
+  1920×1080 uses it but takes 93 ms.
 
 Tried and dropped on the M1:
 
