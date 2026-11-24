@@ -32,7 +32,6 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 
 @implementation Smoother {
     dispatch_queue_t _queue;
-    size_t _nativeWidth, _nativeHeight;
     BOOL _debug, _debugDiff, _prepared;
     int _failed;
 
@@ -157,12 +156,6 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         return NULL;
     }
     return destination;
-}
-
-- (CVPixelBufferRef)displayable:(CVPixelBufferRef)native {
-    BOOL processSized = CVPixelBufferGetWidth(native) == (size_t)kProcessWidth && CVPixelBufferGetHeight(native) == (size_t)kProcessHeight &&
-        CVPixelBufferGetPixelFormatType(native) == kProcessFormat;
-    return [self finished:native large:processSized];
 }
 
 - (CVPixelBufferRef)finished:(CVPixelBufferRef)buffer large:(BOOL)large {
@@ -408,10 +401,8 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 
 - (void)showRest {
     if (!_restFrame) return;
-    CVPixelBufferRef restOut = [self displayable:_restNative];
     double target = MAX(_lastTarget + _period, [self refreshAtOrAfter:HostNow() + kCommitLead]);
-    [self show:restOut target:target];
-    CVPixelBufferRelease(restOut);
+    [self show:_restNative target:target];
     _lastTarget = target;
     CVPixelBufferRelease(_previousFrame);
     _previousFrame = _restFrame;
@@ -424,8 +415,6 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 - (void)handle:(CVPixelBufferRef)native small:(CVPixelBufferRef)small received:(double)received {
     if (_statsStart == 0) _statsStart = received;
     _received++;
-    _nativeWidth = CVPixelBufferGetWidth(native);
-    _nativeHeight = CVPixelBufferGetHeight(native);
     NSUInteger generation = ++_generation;
     CVPixelBufferRelease(_restFrame);
     _restFrame = NULL;
@@ -454,7 +443,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
             _interpSum += HostNow() - begin;
             if (middle) {
                 _interpolated++;
-                BOOL large = (CVPixelBufferGetWidth(native) == (size_t)kProcessWidth * 3 / 2 && CVPixelBufferGetHeight(native) == (size_t)kProcessHeight * 3 / 2) || native == small;
+                BOOL large = CVPixelBufferGetWidth(native) == (size_t)kProcessWidth * 3 / 2 && CVPixelBufferGetHeight(native) == (size_t)kProcessHeight * 3 / 2;
                 middleOut = [self finished:middle large:large];
                 CVPixelBufferRelease(middle);
             }
@@ -476,10 +465,8 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
             CVPixelBufferRelease(middleOut);
             first += step;
         }
-        CVPixelBufferRef realOut = [self displayable:native];
         first = MAX(first, [self refreshAtOrAfter:HostNow() + kCommitLead]);
-        [self show:realOut target:first];
-        CVPixelBufferRelease(realOut);
+        [self show:native target:first];
         _lastTarget = first;
         _delaySum += first - received;
         _delayCount++;
@@ -493,9 +480,9 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     if (_debug) {
         int shown, missed;
         @synchronized (_pending) { shown = _shown; missed = _missed; _shown = _missed = 0; }
-        fprintf(stderr, "smooth: in %zux%zu %.1f fps (unique %.1f) | out %.1f fps | held %d, skipped %d, missed %d, cuts %d | "
+        fprintf(stderr, "smooth: in %.1f fps (unique %.1f) | out %.1f fps | held %d, skipped %d, missed %d, cuts %d | "
                 "interp %.1f ms, upscale %.1f ms | delay %.1f ms\n",
-                _nativeWidth, _nativeHeight, _received / elapsed, _unique / elapsed, shown / elapsed, _holds, _skipped, missed, _cuts,
+                _received / elapsed, _unique / elapsed, shown / elapsed, _holds, _skipped, missed, _cuts,
                 _interpolated ? _interpSum / _interpolated * 1000 : 0, _scaled ? _scaleSum / _scaled * 1000 : 0,
                 _delayCount ? _delaySum / _delayCount * 1000 : 0);
     } else {

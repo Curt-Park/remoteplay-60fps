@@ -31,19 +31,7 @@ chiaki-ng links OpenSSL 3 and would otherwise pick up the wrong headers.
 `run.sh` starts the built chiaki-ng with the Vulkan loader set; arguments are passed on. Without the
 loader chiaki-ng falls back to OpenGL, renders on the main thread, and the stream stutters badly.
 
-Use an SDR stream at 1080p or 720p. During a stream chiaki-ng's own menus are hidden under the picture.
-
-- **1080p**: real frames are shown as decoded, middle frames are rebuilt from 720p. Sharpest, but
-  every other frame has a different quality.
-- **720p**: real and middle frames go through the same upscale to 1080p, so they match. Softer
-  overall. Raise the bitrate to the 1080p default so the smaller picture is compressed less:
-
-  ```sh
-  defaults write com.chiaki.Chiaki settings.resolution_local_ps5 -string 720p
-  defaults write com.chiaki.Chiaki settings.bitrate_local_ps5 -int 15000
-  ```
-
-  `defaults delete com.chiaki.Chiaki <key>` for both keys returns to 1080p.
+Use a 1080p SDR stream. During a stream chiaki-ng's own menus are hidden under the picture.
 
 | Environment variable | Effect |
 |---|---|
@@ -70,8 +58,7 @@ Use an SDR stream at 1080p or 720p. During a stream chiaki-ng's own menus are hi
    next to the last real frame's difference.
 3. **Interpolate** the midpoint of the two 720p copies with `VTLowLatencyFrameInterpolation`. A scene
    cut gets no middle frame.
-4. **Upscale** the middle frame to 1080p with `VTLowLatencySuperResolutionScaler`. With a 720p stream the
-   real frames are upscaled the same way.
+4. **Upscale** the middle frame to 1080p with `VTLowLatencySuperResolutionScaler`.
 5. **Schedule** the middle frame and the untouched real frame for consecutive display refreshes.
 6. **Present** through a `CAMetalLayer` in a borderless child window over chiaki-ng's content, once
    per refresh from a display link on its own thread.
@@ -84,7 +71,6 @@ Use an SDR stream at 1080p or 720p. During a stream chiaki-ng's own menus are hi
 | Interpolation at 1920×1080 | about 100 ms, not usable |
 | Upscale to 1080p | 3–6 ms per frame |
 | On screen | 59–60 picture changes per second, 96–99 % evenly spaced |
-| 720p stream, every frame upscaled | 59–60 fps handed over, 55–59 measured on screen with 96 % evenly spaced |
 | Added delay | about 55–65 ms after a frame is decoded |
 
 Output is exactly twice the number of distinct frames the console sends. About 3 % of game frames
@@ -134,6 +120,7 @@ Tried and dropped on the M1:
 | Sharpening the middle frames | A frame rebuilt from 720p is 0.9 luma levels from its native original unsharpened and 2.3 at sharpness 1.5; alternating with native frames, that shimmered |
 | A second interpolation of the pair shrunk to 640×360 inside a 720p canvas, merged in where the two results differ | Follows large motion in still comparisons (about 14 ms per frame, 60 fps kept), but no visible improvement in play |
 | Showing no middle frame when the picture changed a lot | Removes the smear but those moments run at 30 fps |
+| A 720p stream with real and middle frames through the same upscale, so their quality matches | 60 fps kept, but no visible improvement: the distortion comes from fast motion, not from the quality difference |
 | Showing real frames through 720p as well | Softer and slower (about 38 fps) |
 
 Earlier versions captured a window with ScreenCaptureKit instead of taking frames from chiaki-ng.
