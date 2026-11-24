@@ -26,12 +26,14 @@ static NSString *FourCC(OSType code) {
 
 // Content view of the output window. Double-click, or F / Esc while the window has the keyboard, toggles full screen.
 @interface OutputView : NSView
+@property BOOL passThrough;   // inside a host window: every event goes to the host's own view underneath
 @property (copy) void (^toggleFullScreen)(void);
 @property (copy) BOOL (^isFullScreen)(void);
 @end
 
 @implementation OutputView
-- (BOOL)acceptsFirstResponder { return YES; }
+- (NSView *)hitTest:(NSPoint)point { return self.passThrough ? nil : [super hitTest:point]; }
+- (BOOL)acceptsFirstResponder { return !self.passThrough; }
 - (BOOL)mouseDownCanMoveWindow { return YES; }
 - (void)mouseDown:(NSEvent *)event {
     if (event.clickCount == 2) self.toggleFullScreen(); else [super mouseDown:event];
@@ -113,6 +115,7 @@ static NSString *FourCC(OSType code) {
     int _resyncs, _lateShown;
     BOOL _warmedUp;
     BOOL _outputHidden;   // main thread
+    NSView *_hostView;
     VTPixelTransferSessionRef _submitTransfer;
     CVPixelBufferPoolRef _submitPool;
     NSObject *_sharpenLock;
@@ -121,6 +124,8 @@ static NSString *FourCC(OSType code) {
     int _repeatsInRow, _restShown;
     NSUInteger _captureGeneration;
     CVPixelBufferRef _restFrame;
+    CVPixelBufferRef _restNative;      // the same picture at the source's own size, when the host supplied one
+    CVPixelBufferRef _currentNative;   // set only while a submitted frame is being handled
     double _restTime;
     double _lastNewMean, _lastRepeatMean, _lastNewTime;
     double _motionLevel;   // smoothed frame-to-frame difference of recent new frames
@@ -654,6 +659,38 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     return output;
 }
 
+// Embedded: the picture goes into the host application's own window, above its content, so the host keeps its
+// window management, full screen and input handling. Events pass through to the host's view.
+- (void)attachToHostWindow {
+    NSWindow *host = nil;
+    for (NSWindow *window in NSApp.windows) {
+        if (!window.isVisible || [window isKindOfClass:NSPanel.class] || !window.contentView) continue;
+        if (!host || window.frame.size.width * window.frame.size.height > host.frame.size.width * host.frame.size.height) host = window;
+    }
+    if (!host) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [self attachToHostWindow]; });
+        return;
+    }
+    OutputView *view = [[OutputView alloc] initWithFrame:host.contentView.bounds];
+    view.passThrough = YES;
+    view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    view.wantsLayer = YES;
+    view.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+    [host.contentView addSubview:view positioned:NSWindowAbove relativeTo:nil];
+    _hostView = view;
+    view.hidden = _outputHidden;
+
+    _layer = [CALayer new];
+    _layer.frame = view.bounds;
+    _layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+    _layer.contentsGravity = kCAGravityResizeAspect;
+    _layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+    [view.layer addSublayer:_layer];
+    CADisplayLink *link = [view displayLinkWithTarget:self selector:@selector(refresh:)];
+    [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    fprintf(stderr, "smooth-anything: showing in the host window (%.0fx%.0f pt)\n", view.bounds.size.width, view.bounds.size.height);
+}
+
 - (void)makeOutputWindow {
     NSRect screen = NSScreen.mainScreen.visibleFrame;
     CGFloat width = MIN(1280, screen.size.width * 0.6), height = width * 9 / 16;
@@ -735,14 +772,16 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 }
 
 - (void)hideOutput {
+    _outputHidden = YES;
+    if (self.embedded) { _hostView.hidden = YES; return; }
     if (_fullScreen) [self toggleFullScreen];
     [self.panel orderOut:nil];
-    _outputHidden = YES;
 }
 
 - (void)showOutputIfHidden {
     if (!_outputHidden) return;
     _outputHidden = NO;
+    if (self.embedded) { _hostView.hidden = NO; return; }
     [self.panel orderFrontRegardless];
 }
 
@@ -929,7 +968,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     if (!_restFrame) return;
     double period, grid;
     @synchronized (_pending) { period = _period; grid = _slotVsync; }
-    CVPixelBufferRef frameOut = [self upscaled:_restFrame];
+    CVPixelBufferRef frameOut = _restNative ? CVPixelBufferRetain(_restNative) : [self upscaled:_restFrame];
     double earliest = grid + ceil((HostNow() + kCommitLead - grid) / period - 1e-6) * period;
     double target = MAX(_lastTarget + period, earliest);
     [self show:frameOut target:target];
@@ -941,6 +980,8 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     _previousFrame = _restFrame;
     _previousTime = _restTime;
     _restFrame = NULL;
+    CVPixelBufferRelease(_restNative);
+    _restNative = NULL;
 }
 
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type {
@@ -968,10 +1009,13 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     NSUInteger generation = ++_captureGeneration;
     CVPixelBufferRelease(_restFrame);
     _restFrame = NULL;
+    CVPixelBufferRelease(_restNative);
+    _restNative = NULL;
 
     if ([self isDuplicate:frame]) {
         _duplicates++;
         _restFrame = CVPixelBufferRetain(frame);
+        _restNative = CVPixelBufferRetain(_currentNative);
         _restTime = captureTime;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)), _queue, ^{
             if (self->_captureGeneration == generation) [self showRestFrame];
@@ -1035,7 +1079,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
             first += step;
         }
         double wait = 0;
-        if (_scaler) {
+        if (_scaler && !_currentNative) {
             // The compositor snapshots the screen at the same point of every refresh, and a captured frame's
             // timestamp is one of those points. GPU work running across the next one made the compositor miss
             // refreshes (measured on screen), so the second upscale waits until that point has passed.
@@ -1043,7 +1087,11 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
             double untilComposite = period - sinceComposite;
             if (untilComposite < 0.010) wait = untilComposite + 0.002;
         }
-        if (!_scaler && self.sharpness <= 0) {
+        if (_currentNative) {
+            // The host's frame is already at full size and sharper than anything rebuilt from the processing copy.
+            first = MAX(first, refreshAtOrAfter(HostNow() + kCommitLead));
+            [self show:_currentNative target:first];
+        } else if (!_scaler && self.sharpness <= 0) {
             first = MAX(first, refreshAtOrAfter(HostNow() + kCommitLead));
             [self show:frame target:first];
         } else {
@@ -1111,7 +1159,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 }
 
 // Any thread. Takes a decoded frame straight from a host application instead of capturing a window.
-// Frames of another size are scaled to the processing size first.
+// Frames of another size are scaled to the processing size for interpolation, and shown at their own size.
 - (void)submit:(CVPixelBufferRef)frame {
     double received = HostNow();
     CVPixelBufferRetain(frame);
@@ -1132,7 +1180,12 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
             CVPixelBufferPoolCreatePixelBuffer(NULL, self->_submitPool, &sized);
             if (sized && VTPixelTransferSessionTransferImage(self->_submitTransfer, frame, sized) != noErr) { CVPixelBufferRelease(sized); sized = NULL; }
         }
+        // Only the middle frames need the processing size. Real frames are shown as the host decoded them.
+        OSType sourceFormat = CVPixelBufferGetPixelFormatType(frame);
+        BOOL showable = sourceFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || sourceFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+        self->_currentNative = (!fits && showable && !getenv("SMOOTH_NO_NATIVE")) ? frame : NULL;
         if (sized) [self handleFrame:sized capturedAt:received];
+        self->_currentNative = NULL;
         CVPixelBufferRelease(sized);
         CVPixelBufferRelease(frame);
     });
@@ -1169,7 +1222,7 @@ void SmoothSubmit(CVPixelBufferRef frame) {
         if (getenv("SMOOTH_NO_UPSCALE")) { smoother.upscale = NO; smoother.steady = NO; }
         if (getenv("SMOOTH_SHARPEN")) smoother.sharpness = atof(getenv("SMOOTH_SHARPEN"));
         gEmbedded = smoother;
-        dispatch_async(dispatch_get_main_queue(), ^{ [smoother makeOutputWindow]; });
+        dispatch_async(dispatch_get_main_queue(), ^{ [smoother attachToHostWindow]; });
     });
     [gEmbedded submit:frame];
     dispatch_async(dispatch_get_main_queue(), ^{ [gEmbedded showOutputIfHidden]; });

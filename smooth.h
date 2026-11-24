@@ -7,10 +7,11 @@
 extern "C" {
 #endif
 
-// Any thread. Hands over one decoded 8-bit 4:2:0 frame. The first call opens the output window.
+// Any thread. Hands over one decoded 8-bit 4:2:0 frame. The first call puts the output view into the
+// host's largest window, above its content.
 void SmoothSubmit(CVPixelBufferRef frame);
 
-// Any thread. Hides the output window, for example when the stream ends. The next frame shows it again.
+// Any thread. Hides the output view, for example when the stream ends. The next frame shows it again.
 void SmoothHide(void);
 
 #ifdef __cplusplus
