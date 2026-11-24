@@ -1156,6 +1156,11 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         // middle frames takes a refresh per frame and shows nothing meanwhile, so the timeline restarts instead.
         if (afterPrevious > earliest + 2 * step + period / 2) { afterPrevious = earliest; _resyncs++; }
         double first = MAX(afterPrevious, earliest);
+        // In steady mode the delay is fixed rather than found: the middle frame never goes out before the spare
+        // refresh has passed. Left to settle on its own the schedule drifted between two and three refreshes, and the
+        // two-refresh stretches relied on frames presented outside the display callback, which showed less evenly
+        // on screen (51 changes a second against 59).
+        if (self.steady) first = MAX(first, sourceRefresh + (1 + self.cushion) * step);
         if (middleOut) {
             BOOL behind = first > sourceRefresh + (1 + self.cushion) * step + period / 2;
             // A spare refresh of delay that has gone unused for 3 s is given back.

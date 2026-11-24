@@ -27,7 +27,7 @@ index 7e777e1f..165eed30 100755
  set_target_properties(chiaki PROPERTIES
  		MACOSX_BUNDLE TRUE
 diff --git a/gui/src/qmlbackend.cpp b/gui/src/qmlbackend.cpp
-index d188a790..a3145de7 100644
+index d188a790..8b59b81e 100644
 --- a/gui/src/qmlbackend.cpp
 +++ b/gui/src/qmlbackend.cpp
 @@ -34,6 +34,9 @@
@@ -40,13 +40,15 @@ index d188a790..a3145de7 100644
  #include <chiaki/time.h>
  #include <libavcodec/avcodec.h>
  #include <libavutil/pixdesc.h>
-@@ -1135,6 +1138,15 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
+@@ -1135,6 +1138,17 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
          if (frame.recovered)
              pending_recovered_frame.storeRelaxed(1);
  
 +#ifdef CHIAKI_SMOOTH_ANYTHING
++        extern std::atomic<qint64> smooth_anything_last_frame_us;
 +        // Hardware-decoded frames bypass the stream view: smooth-anything interpolates and shows them itself.
 +        if (frame.frame->format == AV_PIX_FMT_VIDEOTOOLBOX && frame.frame->data[3] && !qEnvironmentVariableIsSet("SMOOTH_OFF")) {
++            smooth_anything_last_frame_us.store(static_cast<qint64>(chiaki_time_now_monotonic_us()), std::memory_order_relaxed);
 +            SmoothSubmit(reinterpret_cast<CVPixelBufferRef>(frame.frame->data[3]));
 +            av_frame_free(&frame.frame);
 +            return;
@@ -56,7 +58,7 @@ index d188a790..a3145de7 100644
          const qint64 prepare_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
          if (!prepareFrameForPresentation(frame, use_opengl_renderer))
          {
-@@ -1163,6 +1175,9 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
+@@ -1163,6 +1177,9 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
      connect(session, &StreamSession::SessionQuit, this, [this, session_for_connections](ChiakiQuitReason reason, const QString &reason_str) {
          if (session != session_for_connections)
              return;
@@ -66,3 +68,35 @@ index d188a790..a3145de7 100644
  
          if (chiaki_quit_reason_is_error(reason)) {
              QString m = tr("Chiaki Session has quit") + ":\n" + chiaki_quit_reason_string(reason);
+diff --git a/gui/src/qmlmainwindow.cpp b/gui/src/qmlmainwindow.cpp
+index 93e0afa3..95e5db47 100644
+--- a/gui/src/qmlmainwindow.cpp
++++ b/gui/src/qmlmainwindow.cpp
+@@ -5406,10 +5406,27 @@ void QmlMainWindow::fullscreenTime()
+         was_maximized = false;
+     showFullScreen();
+ }
++#ifdef CHIAKI_SMOOTH_ANYTHING
++// Set by the stream's frame handler each time a frame goes to smooth-anything instead of this window.
++std::atomic<qint64> smooth_anything_last_frame_us{0};
++#endif
++
+ void QmlMainWindow::update()
+ {
+     Q_ASSERT(QThread::currentThread() == QGuiApplication::instance()->thread());
+ 
++#ifdef CHIAKI_SMOOTH_ANYTHING
++    // While smooth-anything shows the video over this window, redrawing it 30 times a second at full size only
++    // takes GPU time from the interpolation (measured: upscale 10-11 ms instead of 6). Twice a second keeps it alive.
++    {
++        static qint64 last_render_us = 0;
++        const qint64 now_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
++        if (now_us - smooth_anything_last_frame_us.load(std::memory_order_relaxed) < 500000 && now_us - last_render_us < 500000)
++            return;
++        last_render_us = now_us;
++    }
++#endif
++
+     {
+         QMutexLocker locker(&render_schedule_mutex);
+         if (render_scheduled) {

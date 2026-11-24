@@ -1,0 +1,4 @@
+[submodule "chiaki/chiaki-ng"]
+	path = chiaki/chiaki-ng
+	url = https://github.com/chiaki-ng/chiaki-ng
+	ignore = dirty

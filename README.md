@@ -42,20 +42,30 @@ processed at 720p, and a larger window only costs GPU time that the interpolatio
 
 ### Without capture: inside chiaki-ng
 
-`chiaki/` builds chiaki-ng v1.10.1 with smooth-anything compiled in. Decoded frames go straight to the
-interpolator and the result is laid over chiaki-ng's own window, so nothing is captured and chiaki-ng
-does not render the video a second time. Real frames are shown as decoded (1080p); only the middle
-frames are rebuilt from a 720p copy.
+For PS5 this is the better way to run it. chiaki-ng v1.10.1 is included as a submodule and built with
+smooth-anything compiled in. Decoded frames go straight to the interpolator and the result is laid
+over chiaki-ng's own window, so nothing is captured and chiaki-ng does not render the video a second
+time. Real frames are shown as decoded (1080p); only the middle frames are rebuilt from a 720p copy.
 
 ```sh
-git clone --recurse-submodules --branch v1.10.1 https://github.com/chiaki-ng/chiaki-ng
-chiaki/build.sh chiaki-ng          # applies chiaki/smooth-hook.patch and builds
-chiaki/run.sh chiaki-ng            # same settings and registered consoles as the installed chiaki-ng
+brew install qt@6 ffmpeg pkgconf opus openssl@3 cmake ninja nasm protobuf@29 speexdsp libplacebo \
+             json-c miniupnpc libevent sdl2 vulkan-loader molten-vk
+git submodule update --init --recursive
+chiaki/build.sh        # applies chiaki/smooth-hook.patch to the submodule and builds it
+chiaki/run.sh          # same settings and registered consoles as an installed chiaki-ng
 ```
 
-`SMOOTH_OFF=1` runs it as plain chiaki-ng, `SMOOTH_NO_NATIVE=1` sends real frames through 720p as well,
-and `SMOOTH_SHARPEN=<n>` sets the sharpening of the middle frames. HDR streams are not supported.
-chiaki-ng is AGPL-3.0, so a binary built this way is covered by the AGPL.
+Measured on an M1 with a 1080p GTA 6 stream: 59–60 picture changes per second on screen, 96–99 % of
+the motion split evenly, 50 ms behind the decoded stream.
+
+| Environment variable | Effect |
+|---|---|
+| `SMOOTH_OFF=1` | Run as plain chiaki-ng |
+| `SMOOTH_NO_NATIVE=1` | Send real frames through 720p as well (slower: about 38 changes per second here) |
+| `SMOOTH_SHARPEN=<n>` | Sharpening of the middle frames, default 1.5 |
+
+Limits: HDR streams are not supported, and while a stream is shown chiaki-ng's own menus are hidden
+under the picture. chiaki-ng is AGPL-3.0, so a binary built this way is covered by the AGPL.
 
 ### Options
 
@@ -179,6 +189,10 @@ Things that cost time to find:
 - **Faster source displays.** On a 120 Hz display each 30 fps frame is captured four times, twice
   as exact copies. Counting those copies as repeats made the next faint re-encode look like a new
   frame, so exact copies are not counted.
+- **A host's own rendering.** chiaki-ng redrew its empty window 30 times a second at full size during a
+  stream, which took the upscale from 6 ms to 10-11 ms and cost about ten frames a second on screen.
+  The patch limits that to twice a second while smooth-anything has the video. It also needs the
+  Vulkan loader: under the OpenGL fallback chiaki-ng renders on the main thread.
 - **Hidden windows.** A window completely covered by an opaque window is treated as hidden, and its
   captures arrive in bursts about 100 ms apart. The full-screen panel is therefore 0.999 opaque.
   Marking it non-opaque without real translucency was not enough.
