@@ -14,12 +14,17 @@ well. Not affiliated with Sony.
 ## Requirements
 
 - Apple silicon Mac, macOS 27. 1080p interpolation needs an M2 Pro or faster; an M1 uses 720p.
-- Xcode command line tools and Homebrew
-- A PS5 registered in chiaki-ng, streaming 1080p SDR
-- Local Network access for your terminal (System Settings > Privacy & Security > Local Network),
-  or chiaki-ng cannot reach the PS5
+- A PS5 registered in the app, streaming 1080p SDR
+- Local Network access, or the app cannot reach the PS5. The downloaded app asks on first launch;
+  a build run from a terminal uses the terminal's access (System Settings > Privacy & Security >
+  Local Network)
+- To build: Xcode command line tools and Homebrew
 
 ## Build and run
+
+Download the DMG from [Releases](https://github.com/Curt-Park/remoteplay-60fps/releases) and drag the
+app to Applications. It is not notarized, so on first launch allow it under System Settings >
+Privacy & Security > Open Anyway. To build it yourself:
 
 ```sh
 brew install qt@6 ffmpeg pkgconf opus openssl@3 cmake ninja nasm protobuf@29 speexdsp libplacebo \
@@ -32,6 +37,8 @@ git submodule update --init --recursive
 `build.sh` applies `smooth-hook.patch` to the chiaki-ng submodule (v1.10.1) and builds it.
 `run.sh` starts it with the Vulkan loader set and passes arguments on. To check what really reaches
 the screen, run `./verify --match pid:<chiaki pid>` (needs Screen Recording permission).
+`./package.sh <version>` builds the self-contained app, its DMG and a source archive with chiaki-ng
+in `dist/`.
 
 ## How it works
 
@@ -47,6 +54,9 @@ the screen, run `./verify --match pid:<chiaki pid>` (needs Screen Recording perm
 The added delay is about 55–70 ms after a frame is decoded.
 
 ## Environment variables
+
+Set them before `./run.sh`, or before `/Applications/remoteplay-60fps.app/Contents/MacOS/chiaki` for the
+downloaded app.
 
 | Variable | Effect |
 |---|---|
