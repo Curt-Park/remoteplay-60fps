@@ -1,26 +1,26 @@
 diff --git a/gui/CMakeLists.txt b/gui/CMakeLists.txt
-index 7e777e1f..165eed30 100755
+index 7e777e1f..adf7c37d 100755
 --- a/gui/CMakeLists.txt
 +++ b/gui/CMakeLists.txt
 @@ -142,6 +142,23 @@ if(APPLE)
  	target_link_libraries(chiaki "-framework AVFoundation" "-framework IOKit")
  endif()
  
-+# smooth-anything: decoded frames go to its interpolation pipeline and output window instead of the stream view.
++# smooth-anything: decoded frames go to its interpolation pipeline instead of the stream view.
 +# Its source is compiled by hand: enabling the OBJC language here would change how this project's own .m file is built.
 +if(APPLE AND SMOOTH_ANYTHING_DIR)
-+	set(SMOOTH_OBJECT ${CMAKE_CURRENT_BINARY_DIR}/smooth_anything.o)
++	set(SMOOTH_OBJECT ${CMAKE_CURRENT_BINARY_DIR}/smooth.o)
 +	add_custom_command(OUTPUT ${SMOOTH_OBJECT}
-+		COMMAND ${CMAKE_C_COMPILER} -x objective-c -fobjc-arc -O2 -DSMOOTH_EMBEDDED -mmacosx-version-min=26.0
-+			-Wno-unguarded-availability-new -c ${SMOOTH_ANYTHING_DIR}/main.m -o ${SMOOTH_OBJECT}
-+		DEPENDS ${SMOOTH_ANYTHING_DIR}/main.m ${SMOOTH_ANYTHING_DIR}/smooth.h
++		COMMAND ${CMAKE_C_COMPILER} -x objective-c -fobjc-arc -O2 -mmacosx-version-min=26.0
++			-Wno-unguarded-availability-new -c ${SMOOTH_ANYTHING_DIR}/smooth.m -o ${SMOOTH_OBJECT}
++		DEPENDS ${SMOOTH_ANYTHING_DIR}/smooth.m ${SMOOTH_ANYTHING_DIR}/smooth.h
 +		COMMENT "Compiling smooth-anything")
 +	set_source_files_properties(${SMOOTH_OBJECT} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 +	target_sources(chiaki PRIVATE ${SMOOTH_OBJECT})
 +	target_include_directories(chiaki PRIVATE ${SMOOTH_ANYTHING_DIR})
 +	target_compile_definitions(chiaki PRIVATE CHIAKI_SMOOTH_ANYTHING)
-+	target_link_libraries(chiaki "-framework ScreenCaptureKit" "-framework VideoToolbox" "-framework Metal"
-+		"-framework CoreMedia" "-framework CoreVideo" "-framework QuartzCore" "-framework Cocoa")
++	target_link_libraries(chiaki "-framework VideoToolbox" "-framework Metal" "-framework CoreMedia" "-framework CoreVideo"
++		"-framework QuartzCore" "-framework Cocoa")
 +endif()
 +
  # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fanalyzer")

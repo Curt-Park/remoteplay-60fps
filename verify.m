@@ -1,9 +1,3 @@
-// verify: measures what a window actually shows on screen, independent of smooth-anything's own counters.
-// It captures the window at the display rate and reports how often the picture really changes and
-// how evenly the motion is spread across refreshes.
-//
-// Build: ./build.sh      Run: ./verify --match <app name or bundle id> [--seconds 8]
-
 #import <Cocoa/Cocoa.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <CoreMedia/CoreMedia.h>
@@ -18,9 +12,9 @@
     dispatch_queue_t _queue;
     uint8_t *_previousSamples;
     size_t _sampleCount;
-    NSMutableArray<NSNumber *> *_differences;   // one per display refresh, 0 when nothing changed
+    NSMutableArray<NSNumber *> *_differences;
     double _firstTime;
-    double _rate;   // display refreshes per second
+    double _rate;
 }
 
 - (void)start {
@@ -37,7 +31,6 @@
         SCWindow *best = nil;
         for (SCWindow *window in content.windows) {
             SCRunningApplication *app = window.owningApplication;
-            // "pid:<n>" can be matched too, to tell apart two instances of the same app.
             NSString *haystack = [NSString stringWithFormat:@"%@ %@ pid:%d", app.applicationName, app.bundleIdentifier, app.processID];
             if ([haystack rangeOfString:self.match options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
             if (window.frame.size.width < 200 || window.frame.size.height < 150) continue;
@@ -70,7 +63,6 @@
     NSInteger status = [[attachments.firstObject objectForKey:SCStreamFrameInfoStatus] integerValue];
     double time = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer));
     if (_firstTime == 0) _firstTime = time;
-    // One slot per display refresh, placed by the frame's own display timestamp; the first second is warm-up.
     NSInteger slot = (NSInteger)llround((time - _firstTime - 1.0) * _rate);
     while (slot >= 0 && (NSInteger)_differences.count <= slot && _differences.count < 3600) [_differences addObject:@0];
     CVPixelBufferRef buffer = CMSampleBufferGetImageBuffer(sampleBuffer);
@@ -100,8 +92,7 @@
     NSUInteger refreshes = _differences.count;
     if (refreshes < 60) { fprintf(stderr, "Too few frames captured (%lu).\n", (unsigned long)refreshes); exit(1); }
     NSArray<NSNumber *> *sorted = [_differences sortedArrayUsingSelector:@selector(compare:)];
-    double typicalMotion = sorted[refreshes * 3 / 4].doubleValue;   // upper quartile: a refresh that carried real motion
-    // A refresh "moved" when it carries a real share of the motion; faint re-encodes of the same frame do not count.
+    double typicalMotion = sorted[refreshes * 3 / 4].doubleValue;
     double threshold = MAX(0.02, typicalMotion * 0.25);
     NSUInteger moved = 0, pairs = 0, evenPairs = 0;
     for (NSUInteger i = 0; i < refreshes; i++) if (_differences[i].doubleValue >= threshold) moved++;
@@ -116,8 +107,6 @@
     printf("%s: measured %.1f s at the display rate\n", self.match.UTF8String, duration);
     printf("  refreshes showing new motion: %.1f per second\n", moved / duration);
     printf("  motion split evenly across both refreshes of a pair: %.0f%% of pairs\n", pairs ? 100.0 * evenPairs / pairs : 0);
-    // How many refreshes each picture stayed up. An even 30 fps source is all 2s; 1s and 3s are uneven pacing,
-    // and anything longer is a visible hitch.
     NSUInteger held[6] = {0}, run = 0, pictures = 0;
     for (NSUInteger i = 0; i < refreshes; i++) {
         BOOL changed = _differences[i].doubleValue >= threshold;

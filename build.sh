@@ -1,10 +1,23 @@
 #!/bin/sh
 set -e
-cd "$(dirname "$0")"
-clang -fobjc-arc -O2 -Wall -mmacosx-version-min=27.0 main.m -o smooth-anything \
-  -framework Cocoa -framework AVFoundation -framework ScreenCaptureKit \
-  -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework QuartzCore -framework Metal
-echo "built ./smooth-anything"
-clang -fobjc-arc -O2 -Wall -mmacosx-version-min=27.0 verify.m -o verify \
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SRC="$HERE/chiaki-ng"
+[ -f "$SRC/CMakeLists.txt" ] || git -C "$HERE" submodule update --init --recursive
+cd "$SRC"
+if git apply --check "$HERE/smooth-hook.patch" 2>/dev/null; then git apply "$HERE/smooth-hook.patch"; fi
+[ -d build-venv ] || { python3 -m venv build-venv && ./build-venv/bin/pip install -q "protobuf>=5,<6" setuptools; }
+P="$(brew --prefix)"
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHIAKI_ENABLE_CLI=OFF -DCHIAKI_ENABLE_STEAMDECK_NATIVE=OFF \
+  -DPYTHON_EXECUTABLE="$PWD/build-venv/bin/python" -DSMOOTH_ANYTHING_DIR="$HERE" \
+  -DOPENSSL_ROOT_DIR="$P/opt/openssl@3" -DOPENSSL_INCLUDE_DIR="$P/opt/openssl@3/include" \
+  -DOPENSSL_CRYPTO_LIBRARY="$P/opt/openssl@3/lib/libcrypto.dylib" -DOPENSSL_SSL_LIBRARY="$P/opt/openssl@3/lib/libssl.dylib" \
+  -DCMAKE_PREFIX_PATH="$P/opt/openssl@3;$P/opt/qt@6;$P/opt/protobuf@29"
+if [ -L "$P/include/openssl" ] && readlink "$P/include/openssl" | grep -q "openssl@4"; then
+  brew unlink openssl@4 >/dev/null
+  trap 'brew link openssl@4 >/dev/null' EXIT
+fi
+CPATH="$P/opt/ffmpeg/include" PATH="$PWD/build-venv/bin:$PATH" cmake --build build --config Release --target chiaki
+cd "$HERE"
+clang -fobjc-arc -O2 -Wall -mmacosx-version-min=26.0 verify.m -o verify \
   -framework Cocoa -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo
-echo "built ./verify"
+echo "built $SRC/build/gui/chiaki.app and ./verify"
