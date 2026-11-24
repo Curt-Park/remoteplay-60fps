@@ -209,6 +209,12 @@ Things that cost time to find:
   picture shimmered at 30 Hz. Two things fixed most of it: taking still areas straight from the two real
   frames (0.14-0.8 levels), and not sharpening the middle frame, since a rebuilt frame is 0.9 levels from
   its native original unsharpened and 2.3 at sharpness 1.5.
+- **Two real frames agreeing does not mean nothing happened between them.** A pole or wire crossing a point
+  during a camera turn leaves the same sky there in both frames; taking those pixels erased the object from
+  the middle frame in patches, which showed as broken, shimmering lines. The still test therefore also
+  requires the rebuilt middle frame to be within about 8-14 luma levels of the real ones (it is within 3
+  at 97 % of truly still points). On dumped game frames that took wrongly replaced crossing points from
+  about 40 % to none.
 - **Hidden windows.** A window completely covered by an opaque window is treated as hidden, and its
   captures arrive in bursts about 100 ms apart. The full-screen panel is therefore 0.999 opaque.
   Marking it non-opaque without real translucency was not enough.

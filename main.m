@@ -611,15 +611,25 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 - (CVPixelBufferRef)matchedMiddle:(CVPixelBufferRef)middle between:(CVPixelBufferRef)previous and:(CVPixelBufferRef)current {
     static NSString *const shader = @"#include <metal_stdlib>\nusing namespace metal;\n"
         "constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);\n"
-        // Largest luma change between the two real frames at this point and four points 3 px around it.
-        "static float moved(texture2d<float, access::sample> a, texture2d<float, access::sample> b, float2 uv) {\n"
-        "    float2 px = 3.0 / float2(a.get_width(), a.get_height());\n"
-        "    float d = abs(a.sample(s, uv).r - b.sample(s, uv).r);\n"
-        "    d = max(d, abs(a.sample(s, uv + float2(px.x, 0)).r - b.sample(s, uv + float2(px.x, 0)).r));\n"
-        "    d = max(d, abs(a.sample(s, uv - float2(px.x, 0)).r - b.sample(s, uv - float2(px.x, 0)).r));\n"
-        "    d = max(d, abs(a.sample(s, uv + float2(0, px.y)).r - b.sample(s, uv + float2(0, px.y)).r));\n"
-        "    d = max(d, abs(a.sample(s, uv - float2(0, px.y)).r - b.sample(s, uv - float2(0, px.y)).r));\n"
-        "    return smoothstep(0.012, 0.045, d);\n"   // 3 to 11 of 255: above stream noise, below visible motion
+        // How much of the rebuilt middle frame to use here: 0 = nothing happened, 1 = something moved.
+        // Two tests, because agreement between the real frames is not enough: a thin object crossing a point
+        // between them (a pole, a wire) leaves the same background there in both, and taking those pixels erased
+        // the object from the middle frame in patches. So the middle frame itself must also show nothing new.
+        // Where the real frames agree it is within 3 luma levels of them at 97 % of points and within 11 at
+        // 98.7 % (measured on game frames); beyond that something crossed.
+        "static float moved(texture2d<float, access::sample> a, texture2d<float, access::sample> b,\n"
+        "                   texture2d<float, access::sample> m, float2 uv) {\n"
+        "    float2 px = 1.0 / float2(a.get_width(), a.get_height());\n"
+        "    float d = 0, e = 0;\n"
+        "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {\n"
+        "        float2 p = uv + float2(x, y) * 2.0 * px;\n"
+        "        float va = a.sample(s, p).r, vb = b.sample(s, p).r;\n"
+        "        d = max(d, abs(va - vb));\n"
+        "        e = max(e, abs(m.sample(s, p).r - 0.5 * (va + vb)));\n"
+        "    }\n"
+        "    float changed = smoothstep(0.012, 0.045, d);\n"   // 3 to 11 of 255: above stream noise
+        "    float crossed = smoothstep(0.031, 0.055, e);\n"   // 8 to 14 of 255
+        "    return max(changed, crossed);\n"
         "}\n"
         "kernel void luma(texture2d<float, access::sample> prev [[texture(0)]], texture2d<float, access::sample> cur [[texture(1)]],\n"
         "                 texture2d<float, access::sample> mid [[texture(2)]], texture2d<float, access::write> dst [[texture(3)]],\n"
@@ -631,16 +641,16 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         "                         mid.sample(s, uv + float2(o.x, -o.y)).r + mid.sample(s, uv + float2(-o.x, o.y)).r);\n"
         "    float sharp = saturate(c + clamp((c - blur) * amount, -0.10, 0.10));\n"
         "    float still = 0.5 * (prev.sample(s, uv).r + cur.sample(s, uv).r);\n"
-        "    dst.write(float4(mix(still, sharp, moved(prev, cur, uv)), 0, 0, 1), gid);\n"
+        "    dst.write(float4(mix(still, sharp, moved(prev, cur, mid, uv)), 0, 0, 1), gid);\n"
         "}\n"
         "kernel void chroma(texture2d<float, access::sample> prevY [[texture(0)]], texture2d<float, access::sample> curY [[texture(1)]],\n"
         "                   texture2d<float, access::sample> prevC [[texture(2)]], texture2d<float, access::sample> curC [[texture(3)]],\n"
         "                   texture2d<float, access::sample> midC [[texture(4)]], texture2d<float, access::write> dst [[texture(5)]],\n"
-        "                   uint2 gid [[thread_position_in_grid]]) {\n"
+        "                   texture2d<float, access::sample> midY [[texture(6)]], uint2 gid [[thread_position_in_grid]]) {\n"
         "    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;\n"
         "    float2 uv = (float2(gid) + 0.5) / float2(dst.get_width(), dst.get_height());\n"
         "    float2 still = 0.5 * (prevC.sample(s, uv).rg + curC.sample(s, uv).rg);\n"
-        "    dst.write(float4(mix(still, midC.sample(s, uv).rg, moved(prevY, curY, uv)), 0, 1), gid);\n"
+        "    dst.write(float4(mix(still, midC.sample(s, uv).rg, moved(prevY, curY, midY, uv)), 0, 1), gid);\n"
         "}\n";
     CVPixelBufferRef upscaled = [self superResolved:middle];
     size_t width = CVPixelBufferGetWidth(upscaled), height = CVPixelBufferGetHeight(upscaled);
@@ -693,6 +703,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         [compute setTexture:CVMetalTextureGetTexture(chromas[1]) atIndex:3];
         [compute setTexture:CVMetalTextureGetTexture(chromas[2]) atIndex:4];
         [compute setTexture:CVMetalTextureGetTexture(chromas[3]) atIndex:5];
+        [compute setTexture:CVMetalTextureGetTexture(lumas[2]) atIndex:6];
         [compute dispatchThreadgroups:MTLSizeMake((width / 2 + groupWidth - 1) / groupWidth, (height / 2 + groupHeight - 1) / groupHeight, 1)
                 threadsPerThreadgroup:MTLSizeMake(groupWidth, groupHeight, 1)];
         [compute endEncoding];
