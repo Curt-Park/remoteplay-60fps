@@ -55,6 +55,7 @@ static NSString *FourCC(OSType code) {
 @property NSString *match;        // nil = ask with the system window picker
 @property BOOL passthrough;
 @property double sharpness;       // unsharp-mask strength applied to every shown frame; 0 = off
+@property BOOL embedded;          // fed by a host application: no picker, and closing the window does not quit
 @property BOOL logStalls;         // print gaps of 0.12-3 s in source frames and in shown frames
 @property double cropTop;         // points cut from the top of the captured window; negative = automatic
 @property BOOL debugDiff;
@@ -111,6 +112,9 @@ static NSString *FourCC(OSType code) {
     unsigned _recentUpscaleIndex;
     int _resyncs, _lateShown;
     BOOL _warmedUp;
+    BOOL _outputHidden;   // main thread
+    VTPixelTransferSessionRef _submitTransfer;
+    CVPixelBufferPoolRef _submitPool;
     NSObject *_sharpenLock;
     CGWindowID _currentWindowID;
     BOOL _waitingReported;
@@ -276,14 +280,8 @@ static NSString *FourCC(OSType code) {
     NSInteger width = kProcessWidth, height = kProcessHeight;
     fprintf(stderr, "Source %.0fx%.0f pt -> processing at %ldx%ld\n", frame.size.width, frame.size.height, (long)width, (long)height);
 
-    OSType pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-    if (!self.passthrough) {
-        __block OSType chosen = 0;
-        dispatch_sync(_queue, ^{ chosen = self->_processor ? self->_processorFormat : [self startInterpolatorWidth:width height:height]; });
-        if (chosen) { pixelFormat = chosen; _processorFormat = chosen; }
-    }
-    if (self.upscale) dispatch_sync(_queue, ^{ if (!self->_scaler) [self startScalerWidth:width height:height format:pixelFormat]; });
-    dispatch_sync(_queue, ^{ [self warmUpWidth:width height:height format:pixelFormat]; });
+    __block OSType pixelFormat = 0;
+    dispatch_sync(_queue, ^{ pixelFormat = [self prepareSessions]; });
 
     SCStreamConfiguration *config = [SCStreamConfiguration new];
     config.width = width;
@@ -317,6 +315,19 @@ static NSString *FourCC(OSType code) {
 }
 
 // Main thread. A followed app is found again by the next scan; a fixed filter has no scan, so it is restarted here.
+// Capture queue. Starts the interpolator and scaler once and returns the pixel format frames must have.
+- (OSType)prepareSessions {
+    NSInteger width = kProcessWidth, height = kProcessHeight;
+    OSType pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    if (!self.passthrough) {
+        OSType chosen = _processor ? _processorFormat : [self startInterpolatorWidth:width height:height];
+        if (chosen) { pixelFormat = chosen; _processorFormat = chosen; }
+    }
+    if (self.upscale && !_scaler) [self startScalerWidth:width height:height format:pixelFormat];
+    [self warmUpWidth:width height:height format:pixelFormat];
+    return pixelFormat;
+}
+
 - (void)recoverFrom:(SCStream *)stream {
     if (_stream != stream) return;
     [self stopCapture];
@@ -720,7 +731,19 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 }
 
 - (void)windowWillClose:(NSNotification *)notification {
-    exit(0);
+    if (!self.embedded) exit(0);
+}
+
+- (void)hideOutput {
+    if (_fullScreen) [self toggleFullScreen];
+    [self.panel orderOut:nil];
+    _outputHidden = YES;
+}
+
+- (void)showOutputIfHidden {
+    if (!_outputHidden) return;
+    _outputHidden = NO;
+    [self.panel orderFrontRegardless];
 }
 
 // Remote Play repeats each 30 fps game frame; repeats must not reach the interpolator.
@@ -927,7 +950,11 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     CVPixelBufferRef frame = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!frame || status.integerValue != SCFrameStatusComplete) return;
 
-    double captureTime = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer));
+    [self handleFrame:frame capturedAt:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))];
+}
+
+// Capture queue. `frame` is at the processing size; `captureTime` is when the source showed it, or received it.
+- (void)handleFrame:(CVPixelBufferRef)frame capturedAt:(double)captureTime {
     double arrival = HostNow();
     @synchronized (_pending) { if (_slotVsync > 0) { _phaseSum += fmod(arrival - _slotVsync + 10.0, _period); _phaseCount++; } }
     if (_statsStart == 0) _statsStart = arrival;
@@ -1083,22 +1110,80 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     }
 }
 
+// Any thread. Takes a decoded frame straight from a host application instead of capturing a window.
+// Frames of another size are scaled to the processing size first.
+- (void)submit:(CVPixelBufferRef)frame {
+    double received = HostNow();
+    CVPixelBufferRetain(frame);
+    dispatch_async(_queue, ^{
+        OSType format = [self prepareSessions];
+        CVPixelBufferRef sized = NULL;
+        BOOL fits = CVPixelBufferGetWidth(frame) == (size_t)kProcessWidth && CVPixelBufferGetHeight(frame) == (size_t)kProcessHeight &&
+                    CVPixelBufferGetPixelFormatType(frame) == format;
+        if (fits) {
+            sized = CVPixelBufferRetain(frame);
+        } else {
+            if (!self->_submitTransfer) {
+                VTPixelTransferSessionCreate(NULL, &self->_submitTransfer);
+                self->_submitPool = NewPool(@{}, kProcessWidth, kProcessHeight, format);
+                fprintf(stderr, "Scaling %zux%zu frames to %ldx%ld for processing\n", CVPixelBufferGetWidth(frame), CVPixelBufferGetHeight(frame),
+                        (long)kProcessWidth, (long)kProcessHeight);
+            }
+            CVPixelBufferPoolCreatePixelBuffer(NULL, self->_submitPool, &sized);
+            if (sized && VTPixelTransferSessionTransferImage(self->_submitTransfer, frame, sized) != noErr) { CVPixelBufferRelease(sized); sized = NULL; }
+        }
+        if (sized) [self handleFrame:sized capturedAt:received];
+        CVPixelBufferRelease(sized);
+        CVPixelBufferRelease(frame);
+    });
+}
+
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
     fprintf(stderr, "Capture stopped (%s); looking for the window again.\n", error.localizedDescription.UTF8String);
     dispatch_async(dispatch_get_main_queue(), ^{ [self recoverFrom:stream]; });
 }
 @end
 
+// Default: sharpest picture and steadiest pacing (1080p, one spare refresh kept).
+static Smoother *NewSmoother(void) {
+    Smoother *smoother = [Smoother new];
+    smoother.upscale = YES;
+    smoother.steady = YES;
+    smoother.cushion = 1;
+    smoother.cropTop = -1;
+    smoother.logStalls = YES;
+    smoother.sharpness = 1.5;   // chosen by eye on game frames: clearly crisper, while 2.5 starts to amplify compression noise
+    return smoother;
+}
+
+#ifdef SMOOTH_EMBEDDED
+
+// Entry points for a host application that feeds decoded frames itself (see smooth.h).
+static Smoother *gEmbedded;
+
+void SmoothSubmit(CVPixelBufferRef frame) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Smoother *smoother = NewSmoother();
+        smoother.embedded = YES;
+        if (getenv("SMOOTH_NO_UPSCALE")) { smoother.upscale = NO; smoother.steady = NO; }
+        if (getenv("SMOOTH_SHARPEN")) smoother.sharpness = atof(getenv("SMOOTH_SHARPEN"));
+        gEmbedded = smoother;
+        dispatch_async(dispatch_get_main_queue(), ^{ [smoother makeOutputWindow]; });
+    });
+    [gEmbedded submit:frame];
+    dispatch_async(dispatch_get_main_queue(), ^{ [gEmbedded showOutputIfHidden]; });
+}
+
+void SmoothHide(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{ [gEmbedded hideOutput]; });
+}
+
+#else
+
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        Smoother *smoother = [Smoother new];
-        // Default: sharpest picture and steadiest pacing (1080p, one spare refresh kept, 50 ms behind the source).
-        smoother.upscale = YES;
-        smoother.steady = YES;
-        smoother.cushion = 1;
-        smoother.cropTop = -1;
-        smoother.logStalls = YES;
-        smoother.sharpness = 1.5;   // chosen by eye on game frames: clearly crisper, while 2.5 starts to amplify compression noise
+        Smoother *smoother = NewSmoother();
         double seconds = 0;
         BOOL lowLatency = NO, sharpnessGiven = NO;
         for (int i = 1; i < argc; i++) {
@@ -1141,3 +1226,5 @@ int main(int argc, const char *argv[]) {
     }
     return 0;
 }
+
+#endif
