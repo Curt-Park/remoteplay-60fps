@@ -131,6 +131,12 @@ static NSString *FourCC(OSType code) {
     CVPixelBufferRef _restFrame;
     CVPixelBufferRef _restNative;      // the same picture at the source's own size, when the host supplied one
     CVPixelBufferRef _currentNative;   // set only while a submitted frame is being handled
+    CVPixelBufferRef _previousNative;  // native-size counterpart of _previousFrame
+    id<MTLDevice> _matchDevice;
+    id<MTLCommandQueue> _matchQueue;
+    id<MTLComputePipelineState> _matchLuma, _matchChroma;
+    CVMetalTextureCacheRef _matchCache;
+    CVPixelBufferPoolRef _matchPool;
     double _restTime;
     double _lastNewMean, _lastRepeatMean, _lastNewTime;
     double _motionLevel;   // smoothed frame-to-frame difference of recent new frames
@@ -271,6 +277,8 @@ static NSString *FourCC(OSType code) {
         self->_previousFrame = NULL;
         CVPixelBufferRelease(self->_restFrame);
         self->_restFrame = NULL;
+        CVPixelBufferRelease(self->_previousNative);
+        self->_previousNative = NULL;
         CVPixelBufferRelease(self->_largeCache);
         CVPixelBufferRelease(self->_largeCacheSource);
         self->_largeCache = self->_largeCacheSource = NULL;
@@ -595,6 +603,142 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 // stream carries little detail beyond 720p, so no upscaler recovers more; raising edge contrast is what makes
 // the picture read as sharper. The push is capped so strong edges do not grow halos.
 // Returns a retained buffer, or NULL when sharpening is unavailable.
+// Finishes a middle frame for display between two native-size real frames. The middle frame is rebuilt from a
+// 720p copy, so it is softer than its neighbours, and alternating the two every refresh made the picture
+// shimmer. Wherever the two real frames agree (HUD, text, anything standing still) the result takes its pixels
+// from them and is identical to both; only where something moved does it use the super-resolved, sharpened
+// middle frame, and there motion hides the difference. Returns a retained buffer, or NULL to fall back.
+- (CVPixelBufferRef)matchedMiddle:(CVPixelBufferRef)middle between:(CVPixelBufferRef)previous and:(CVPixelBufferRef)current {
+    static NSString *const shader = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        "constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);\n"
+        // Largest luma change between the two real frames at this point and four points 3 px around it.
+        "static float moved(texture2d<float, access::sample> a, texture2d<float, access::sample> b, float2 uv) {\n"
+        "    float2 px = 3.0 / float2(a.get_width(), a.get_height());\n"
+        "    float d = abs(a.sample(s, uv).r - b.sample(s, uv).r);\n"
+        "    d = max(d, abs(a.sample(s, uv + float2(px.x, 0)).r - b.sample(s, uv + float2(px.x, 0)).r));\n"
+        "    d = max(d, abs(a.sample(s, uv - float2(px.x, 0)).r - b.sample(s, uv - float2(px.x, 0)).r));\n"
+        "    d = max(d, abs(a.sample(s, uv + float2(0, px.y)).r - b.sample(s, uv + float2(0, px.y)).r));\n"
+        "    d = max(d, abs(a.sample(s, uv - float2(0, px.y)).r - b.sample(s, uv - float2(0, px.y)).r));\n"
+        "    return smoothstep(0.012, 0.045, d);\n"   // 3 to 11 of 255: above stream noise, below visible motion
+        "}\n"
+        "kernel void luma(texture2d<float, access::sample> prev [[texture(0)]], texture2d<float, access::sample> cur [[texture(1)]],\n"
+        "                 texture2d<float, access::sample> mid [[texture(2)]], texture2d<float, access::write> dst [[texture(3)]],\n"
+        "                 constant float &amount [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {\n"
+        "    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;\n"
+        "    float2 size = float2(dst.get_width(), dst.get_height()), uv = (float2(gid) + 0.5) / size, o = 1.25 / size;\n"
+        "    float c = mid.sample(s, uv).r;\n"
+        "    float blur = 0.25 * (mid.sample(s, uv + o).r + mid.sample(s, uv - o).r +\n"
+        "                         mid.sample(s, uv + float2(o.x, -o.y)).r + mid.sample(s, uv + float2(-o.x, o.y)).r);\n"
+        "    float sharp = saturate(c + clamp((c - blur) * amount, -0.10, 0.10));\n"
+        "    float still = 0.5 * (prev.sample(s, uv).r + cur.sample(s, uv).r);\n"
+        "    dst.write(float4(mix(still, sharp, moved(prev, cur, uv)), 0, 0, 1), gid);\n"
+        "}\n"
+        "kernel void chroma(texture2d<float, access::sample> prevY [[texture(0)]], texture2d<float, access::sample> curY [[texture(1)]],\n"
+        "                   texture2d<float, access::sample> prevC [[texture(2)]], texture2d<float, access::sample> curC [[texture(3)]],\n"
+        "                   texture2d<float, access::sample> midC [[texture(4)]], texture2d<float, access::write> dst [[texture(5)]],\n"
+        "                   uint2 gid [[thread_position_in_grid]]) {\n"
+        "    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;\n"
+        "    float2 uv = (float2(gid) + 0.5) / float2(dst.get_width(), dst.get_height());\n"
+        "    float2 still = 0.5 * (prevC.sample(s, uv).rg + curC.sample(s, uv).rg);\n"
+        "    dst.write(float4(mix(still, midC.sample(s, uv).rg, moved(prevY, curY, uv)), 0, 1), gid);\n"
+        "}\n";
+    CVPixelBufferRef upscaled = [self superResolved:middle];
+    size_t width = CVPixelBufferGetWidth(upscaled), height = CVPixelBufferGetHeight(upscaled);
+    BOOL sameShape = CVPixelBufferGetWidth(previous) == width && CVPixelBufferGetHeight(previous) == height &&
+                     CVPixelBufferGetWidth(current) == width && CVPixelBufferGetHeight(current) == height &&
+                     CVPixelBufferGetPixelFormatType(previous) == CVPixelBufferGetPixelFormatType(upscaled) &&
+                     CVPixelBufferGetPixelFormatType(current) == CVPixelBufferGetPixelFormatType(upscaled);
+    if (!sameShape) { CVPixelBufferRelease(upscaled); return NULL; }
+    if (!_matchDevice) {
+        _matchDevice = MTLCreateSystemDefaultDevice();
+        _matchQueue = [_matchDevice newCommandQueue];
+        NSError *error = nil;
+        id<MTLLibrary> library = [_matchDevice newLibraryWithSource:shader options:nil error:&error];
+        id<MTLFunction> lumaFunction = [library newFunctionWithName:@"luma"], chromaFunction = [library newFunctionWithName:@"chroma"];
+        _matchLuma = lumaFunction ? [_matchDevice newComputePipelineStateWithFunction:lumaFunction error:&error] : nil;
+        _matchChroma = chromaFunction ? [_matchDevice newComputePipelineStateWithFunction:chromaFunction error:&error] : nil;
+        CVMetalTextureCacheCreate(NULL, NULL, _matchDevice, NULL, &_matchCache);
+        NSDictionary *attributes = @{(id)kCVPixelBufferWidthKey: @(width), (id)kCVPixelBufferHeightKey: @(height),
+                                     (id)kCVPixelBufferPixelFormatTypeKey: @(CVPixelBufferGetPixelFormatType(upscaled)),
+                                     (id)kCVPixelBufferIOSurfacePropertiesKey: @{}, (id)kCVPixelBufferMetalCompatibilityKey: @YES};
+        CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)attributes, &_matchPool);
+        if (!_matchLuma || !_matchChroma) fprintf(stderr, "Middle frames cannot be matched to real ones: %s\n", error.localizedDescription.UTF8String);
+    }
+    CVPixelBufferRef output = NULL;
+    if (_matchLuma && _matchChroma) CVPixelBufferPoolCreatePixelBuffer(NULL, _matchPool, &output);
+    if (!output) { CVPixelBufferRelease(upscaled); return NULL; }
+    double begin = HostNow();
+    CVPixelBufferRef buffers[4] = {previous, current, upscaled, output};
+    CVMetalTextureRef lumas[4] = {NULL}, chromas[4] = {NULL};
+    BOOL ok = YES;
+    for (int i = 0; i < 4; i++) {
+        CVMetalTextureCacheCreateTextureFromImage(NULL, _matchCache, buffers[i], NULL, MTLPixelFormatR8Unorm, width, height, 0, &lumas[i]);
+        CVMetalTextureCacheCreateTextureFromImage(NULL, _matchCache, buffers[i], NULL, MTLPixelFormatRG8Unorm, width / 2, height / 2, 1, &chromas[i]);
+        ok = ok && lumas[i] && chromas[i];
+    }
+    if (ok) {
+        id<MTLCommandBuffer> commands = [_matchQueue commandBuffer];
+        id<MTLComputeCommandEncoder> compute = [commands computeCommandEncoder];
+        float amount = (float)self.sharpness;
+        NSUInteger groupWidth = _matchLuma.threadExecutionWidth, groupHeight = _matchLuma.maxTotalThreadsPerThreadgroup / groupWidth;
+        [compute setComputePipelineState:_matchLuma];
+        for (int i = 0; i < 4; i++) [compute setTexture:CVMetalTextureGetTexture(lumas[i]) atIndex:i];
+        [compute setBytes:&amount length:sizeof(amount) atIndex:0];
+        [compute dispatchThreadgroups:MTLSizeMake((width + groupWidth - 1) / groupWidth, (height + groupHeight - 1) / groupHeight, 1)
+                threadsPerThreadgroup:MTLSizeMake(groupWidth, groupHeight, 1)];
+        [compute setComputePipelineState:_matchChroma];
+        [compute setTexture:CVMetalTextureGetTexture(lumas[0]) atIndex:0];
+        [compute setTexture:CVMetalTextureGetTexture(lumas[1]) atIndex:1];
+        [compute setTexture:CVMetalTextureGetTexture(chromas[0]) atIndex:2];
+        [compute setTexture:CVMetalTextureGetTexture(chromas[1]) atIndex:3];
+        [compute setTexture:CVMetalTextureGetTexture(chromas[2]) atIndex:4];
+        [compute setTexture:CVMetalTextureGetTexture(chromas[3]) atIndex:5];
+        [compute dispatchThreadgroups:MTLSizeMake((width / 2 + groupWidth - 1) / groupWidth, (height / 2 + groupHeight - 1) / groupHeight, 1)
+                threadsPerThreadgroup:MTLSizeMake(groupWidth, groupHeight, 1)];
+        [compute endEncoding];
+        [commands commit];
+        [commands waitUntilCompleted];
+        ok = commands.error == nil;
+        CVBufferPropagateAttachments(current, output);
+    }
+    for (int i = 0; i < 4; i++) { if (lumas[i]) CFRelease(lumas[i]); if (chromas[i]) CFRelease(chromas[i]); }
+    CVPixelBufferRelease(upscaled);
+    if (!ok) { CVPixelBufferRelease(output); return NULL; }
+    _scaleSum += HostNow() - begin;
+    _scaled++;
+    return output;
+}
+
+// Diagnostic (SMOOTH_FLICKER): how far a middle frame's luma is from its two real neighbours where they agree,
+// for the plain super-resolved middle frame and for the one actually shown.
+- (void)measureFlickerOf:(CVPixelBufferRef)plain and:(CVPixelBufferRef)shown between:(CVPixelBufferRef)previous and:(CVPixelBufferRef)current {
+    static double plainSum, shownSum; static long still, total; static int frames;
+    CVPixelBufferRef buffers[4] = {plain, shown, previous, current};
+    const uint8_t *base[4]; size_t stride[4];
+    size_t width = CVPixelBufferGetWidth(previous), height = CVPixelBufferGetHeight(previous);
+    for (int i = 0; i < 4; i++) {
+        if (CVPixelBufferGetWidth(buffers[i]) != width || CVPixelBufferGetHeight(buffers[i]) != height) return;
+        CVPixelBufferLockBaseAddress(buffers[i], kCVPixelBufferLock_ReadOnly);
+        base[i] = CVPixelBufferGetBaseAddressOfPlane(buffers[i], 0);
+        stride[i] = CVPixelBufferGetBytesPerRowOfPlane(buffers[i], 0);
+    }
+    for (size_t y = 4; y < height; y += 8) for (size_t x = 4; x < width; x += 8) {
+        int a = base[2][y * stride[2] + x], b = base[3][y * stride[3] + x];
+        total++;
+        if (abs(a - b) > 2) continue;
+        still++;
+        double reference = (a + b) / 2.0;
+        plainSum += fabs(base[0][y * stride[0] + x] - reference);
+        shownSum += fabs(base[1][y * stride[1] + x] - reference);
+    }
+    for (int i = 0; i < 4; i++) CVPixelBufferUnlockBaseAddress(buffers[i], kCVPixelBufferLock_ReadOnly);
+    if (++frames % 60 == 0 && still) {
+        fprintf(stderr, "FLICKER still area %.0f%% | middle vs real frames there: plain %.2f levels, shown %.2f levels\n",
+                100.0 * still / total, plainSum / still, shownSum / still);
+        plainSum = shownSum = 0; still = total = 0;
+    }
+}
+
 - (CVPixelBufferRef)sharpened:(CVPixelBufferRef)source {
     static NSString *const shader = @"#include <metal_stdlib>\nusing namespace metal;\n"
         "kernel void sharpen(texture2d<float, access::sample> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]],\n"
@@ -1077,7 +1221,8 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     _previousFrame = _restFrame;
     _previousTime = _restTime;
     _restFrame = NULL;
-    CVPixelBufferRelease(_restNative);
+    CVPixelBufferRelease(_previousNative);
+    _previousNative = _restNative;
     _restNative = NULL;
 }
 
@@ -1140,7 +1285,17 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
             double elapsed = HostNow() - begin;
             _interpSum += elapsed;
             _interpMax = MAX(_interpMax, elapsed);
-            if (middles) { _interpolated++; middleOut = [self upscaled:(__bridge CVPixelBufferRef)middles[0]]; }
+            if (middles) {
+                _interpolated++;
+                CVPixelBufferRef middle = (__bridge CVPixelBufferRef)middles[0];
+                if (_currentNative && _previousNative && !getenv("SMOOTH_NO_BLEND")) middleOut = [self matchedMiddle:middle between:_previousNative and:_currentNative];
+                if (!middleOut) middleOut = [self upscaled:middle];
+                if (getenv("SMOOTH_FLICKER") && _currentNative && _previousNative) {
+                    CVPixelBufferRef plain = [self upscaled:middle];
+                    [self measureFlickerOf:plain and:middleOut between:_previousNative and:_currentNative];
+                    CVPixelBufferRelease(plain);
+                }
+            }
         }
 
         // Source frames are evenly spaced in game time even when delivery jitter lands them one or three refreshes
@@ -1244,6 +1399,8 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         CVPixelBufferRelease(_previousFrame);
         _previousFrame = CVPixelBufferRetain(frame);
         _previousTime = captureTime;
+        CVPixelBufferRelease(_previousNative);
+        _previousNative = CVPixelBufferRetain(_currentNative);
     }
 
     double elapsed = arrival - _statsStart;
@@ -1336,6 +1493,9 @@ void SmoothSubmit(CVPixelBufferRef frame) {
         Smoother *smoother = NewSmoother();
         smoother.embedded = YES;
         if (getenv("SMOOTH_NO_UPSCALE")) { smoother.upscale = NO; smoother.steady = NO; }
+        // Next to native real frames a sharpened middle frame is the odd one out: rebuilt from 720p, a frame was
+        // 0.9 luma levels from its native original unsharpened and 2.3 at the usual 1.5 (measured on a game stream).
+        if (!getenv("SMOOTH_NO_NATIVE")) smoother.sharpness = 0;
         if (getenv("SMOOTH_SHARPEN")) smoother.sharpness = atof(getenv("SMOOTH_SHARPEN"));
         if (getenv("SMOOTH_DIFF")) smoother.debugDiff = YES;
         gEmbedded = smoother;

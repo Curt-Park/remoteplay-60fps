@@ -46,6 +46,8 @@ For PS5 this is the better way to run it. chiaki-ng v1.10.1 is included as a sub
 smooth-anything compiled in. Decoded frames go straight to the interpolator and the result is laid
 over chiaki-ng's own window, so nothing is captured and chiaki-ng does not render the video a second
 time. Real frames are shown as decoded (1080p); only the middle frames are rebuilt from a 720p copy.
+Wherever the two neighbouring real frames agree (HUD, text, anything standing still) a middle frame
+takes its pixels from them, so only moving areas come from the rebuilt picture.
 
 ```sh
 brew install qt@6 ffmpeg pkgconf opus openssl@3 cmake ninja nasm protobuf@29 speexdsp libplacebo \
@@ -62,8 +64,9 @@ the motion split evenly, 50 ms behind the decoded stream.
 |---|---|
 | `SMOOTH_OFF=1` | Run as plain chiaki-ng |
 | `SMOOTH_NO_NATIVE=1` | Send real frames through 720p as well (slower: about 38 changes per second here) |
-| `SMOOTH_SHARPEN=<n>` | Sharpening of the middle frames, default 1.5 |
-| `SMOOTH_DEBUG=1`, `SMOOTH_DIFF=1` | Print scheduler counters, and how each decoded frame was classified |
+| `SMOOTH_SHARPEN=<n>` | Sharpen the moving areas of middle frames. Off by default: it makes them differ from the real frames |
+| `SMOOTH_NO_BLEND=1` | Use the rebuilt middle frame everywhere, still areas included |
+| `SMOOTH_DEBUG=1`, `SMOOTH_DIFF=1`, `SMOOTH_FLICKER=1` | Print scheduler counters, how each decoded frame was classified, and how far middle frames are from real ones in still areas |
 
 Limits: HDR streams are not supported, and while a stream is shown chiaki-ng's own menus are hidden
 under the picture. chiaki-ng is AGPL-3.0, so a binary built this way is covered by the AGPL.
@@ -201,6 +204,11 @@ Things that cost time to find:
 - **What is left is the source.** In a 60 fps Remote Play stream of a 30 fps game about 3 % of game frames
   are held for three refreshes instead of two, and most are not made up afterwards. Each costs one held
   refresh in the output: `out` is exactly twice `unique` in every two-second window.
+- **Mixing native and rebuilt frames flickers unless they match.** Shown between native 1080p frames, a
+  middle frame rebuilt from 720p was 2.0-2.6 luma levels away from its neighbours in still areas, and the
+  picture shimmered at 30 Hz. Two things fixed most of it: taking still areas straight from the two real
+  frames (0.14-0.8 levels), and not sharpening the middle frame, since a rebuilt frame is 0.9 levels from
+  its native original unsharpened and 2.3 at sharpness 1.5.
 - **Hidden windows.** A window completely covered by an opaque window is treated as hidden, and its
   captures arrive in bursts about 100 ms apart. The full-screen panel is therefore 0.999 opaque.
   Marking it non-opaque without real translucency was not enough.
