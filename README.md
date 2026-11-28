@@ -69,3 +69,4 @@ downloaded app.
 | `SMOOTH_INTERP_720=1` | Interpolate at 720p even on a Mac fast enough for 1080p |
 | `SMOOTH_DEBUG=1` | Print frame rates, timings and delay every two seconds |
 | `SMOOTH_DIFF=1` | Print how each decoded frame was classified, with its arrival time and the values the decision used |
+| `SMOOTH_DUMP=<dir>` | Save up to 15 raw NV12 triples (previous real frame, middle, next real frame) during fast motion, for offline comparison |

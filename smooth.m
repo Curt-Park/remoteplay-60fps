@@ -75,6 +75,11 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
 
     double _sourceInterval, _lastTarget;
 
+    NSString *_dumpDirectory;
+    dispatch_queue_t _dumpQueue;
+    int _dumpCount, _dumpCandidates;
+    double _lastMean;
+
     double _statsStart, _interpSum, _scaleSum, _delaySum;
     int _received, _unique, _interpolated, _scaled, _cuts, _holds, _skipped, _delayCount;
 }
@@ -89,6 +94,10 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     _debug = getenv("SMOOTH_DEBUG") != NULL;
     _debugDiff = getenv("SMOOTH_DIFF") != NULL;
     _wantFull = getenv("SMOOTH_INTERP_720") == NULL;
+    if (getenv("SMOOTH_DUMP")) {
+        _dumpDirectory = @(getenv("SMOOTH_DUMP"));
+        _dumpQueue = dispatch_queue_create("smooth.dump", DISPATCH_QUEUE_SERIAL);
+    }
     _device = MTLCreateSystemDefaultDevice();
     _commands = [_device newCommandQueue];
     CVMetalTextureCacheCreate(NULL, NULL, _device, NULL, &_textures);
@@ -198,6 +207,41 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         return NULL;
     }
     return destination;
+}
+
+static void WriteNV12(CVPixelBufferRef buffer, NSString *path) {
+    CVPixelBufferLockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
+    FILE *file = fopen(path.fileSystemRepresentation, "wb");
+    if (file) {
+        size_t width = CVPixelBufferGetWidth(buffer);
+        for (size_t plane = 0; plane < 2; plane++) {
+            const uint8_t *base = CVPixelBufferGetBaseAddressOfPlane(buffer, plane);
+            size_t stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, plane);
+            size_t rows = CVPixelBufferGetHeightOfPlane(buffer, plane);
+            for (size_t row = 0; row < rows; row++) fwrite(base + row * stride, 1, width, file);
+        }
+        fclose(file);
+    }
+    CVPixelBufferUnlockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
+}
+
+- (void)dumpPrevious:(CVPixelBufferRef)previous middle:(CVPixelBufferRef)middle current:(CVPixelBufferRef)current {
+    int index = _dumpCount++;
+    double mean = _lastMean;
+    NSString *directory = _dumpDirectory;
+    CVPixelBufferRetain(previous);
+    CVPixelBufferRetain(middle);
+    CVPixelBufferRetain(current);
+    dispatch_async(_dumpQueue, ^{
+        NSString *size = [NSString stringWithFormat:@"%zux%zu", CVPixelBufferGetWidth(middle), CVPixelBufferGetHeight(middle)];
+        WriteNV12(previous, [directory stringByAppendingFormat:@"/%02d_a_%@.nv12", index, size]);
+        WriteNV12(middle, [directory stringByAppendingFormat:@"/%02d_m_%@.nv12", index, size]);
+        WriteNV12(current, [directory stringByAppendingFormat:@"/%02d_b_%@.nv12", index, size]);
+        fprintf(stderr, "smooth: dumped %02d (mean %.2f, %s)\n", index, mean, size.UTF8String);
+        CVPixelBufferRelease(previous);
+        CVPixelBufferRelease(middle);
+        CVPixelBufferRelease(current);
+    });
 }
 
 - (CVPixelBufferRef)finished:(CVPixelBufferRef)buffer large:(BOOL)large {
@@ -346,6 +390,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     }
     CVPixelBufferUnlockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
     double mean = (double)total / (double)count;
+    _lastMean = mean;
     double now = HostNow();
     if (now - _lastNewTime > 0.15) _lastNewMean = 0;
     double diagNew = _lastNewMean, diagRepeat = _lastRepeatMean;
@@ -487,6 +532,9 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
             double begin = HostNow();
             CVPixelBufferRef middle = [self interpolateFrom:_previousFrame at:_previousTime to:input at:received];
             _interpSum += HostNow() - begin;
+            if (middle && _dumpDirectory && _lastMean > 6.0 && _dumpCount < 15 && _dumpCandidates++ % 10 == 0) {
+                [self dumpPrevious:_previousFrame middle:middle current:input];
+            }
             if (middle) {
                 _interpolated++;
                 BOOL large = CVPixelBufferGetWidth(native) == (size_t)kProcessWidth * 3 / 2 && CVPixelBufferGetHeight(native) == (size_t)kProcessHeight * 3 / 2;
