@@ -47,7 +47,10 @@ in `dist/`.
    recognised by its small difference from the first.
 3. **Interpolate** the midpoint of two game frames with `VTLowLatencyFrameInterpolation` at 1080p.
    If a warm-up call takes over 25 ms, it uses 720p and upscales the result with
-   `VTLowLatencySuperResolutionScaler`. Scene cuts get no middle frame.
+   `VTLowLatencySuperResolutionScaler`. Scene cuts get no middle frame, and neither does a frame that
+   arrives too soon after the previous one for a refresh to fit between them (menus, near-still
+   pictures whose copies all read as new); otherwise such frames booked two refreshes each and the
+   delay grew past 200 ms.
 4. **Schedule** the middle frame and the untouched real frame on consecutive display refreshes.
 5. **Present** through a Metal layer in a child window over chiaki-ng, driven by a display link and
    synced to the display refresh. Unsynced, a full-screen picture changed mid-scan and tore along a
@@ -65,4 +68,4 @@ downloaded app.
 | `SMOOTH_OFF=1` | Run as plain chiaki-ng |
 | `SMOOTH_INTERP_720=1` | Interpolate at 720p even on a Mac fast enough for 1080p |
 | `SMOOTH_DEBUG=1` | Print frame rates, timings and delay every two seconds |
-| `SMOOTH_DIFF=1` | Print how each decoded frame was classified |
+| `SMOOTH_DIFF=1` | Print how each decoded frame was classified, with its arrival time and the values the decision used |

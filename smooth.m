@@ -323,7 +323,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     [_child orderFront:nil];
 }
 
-- (BOOL)isDuplicate:(CVPixelBufferRef)buffer {
+- (BOOL)isDuplicate:(CVPixelBufferRef)buffer received:(double)received {
     CVPixelBufferLockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
     const uint8_t *base = CVPixelBufferGetBaseAddressOfPlane(buffer, 0);
     size_t stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0);
@@ -348,6 +348,8 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     double mean = (double)total / (double)count;
     double now = HostNow();
     if (now - _lastNewTime > 0.15) _lastNewMean = 0;
+    double diagNew = _lastNewMean, diagRepeat = _lastRepeatMean;
+    int diagRun = _repeatsInRow;
     BOOL identical = mean < 0.01 && strong == 0;
     BOOL refinement = NO;
     if (_repeatsInRow == 0) refinement = mean < kRepeatRatio * _lastNewMean;
@@ -357,7 +359,8 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     if (duplicate) _lastRepeatMean = mean; else { _lastNewMean = mean; _lastNewTime = now; }
     _sceneCut = comparable && !duplicate && mean > 12.0 && mean > 2.5 * _motionLevel;
     if (!duplicate) _motionLevel += 0.2 * (mean - _motionLevel);
-    if (_debugDiff) fprintf(stderr, "diff mean %.3f strong %d %s\n", mean, strong, duplicate ? "repeat" : _sceneCut ? "cut" : "new");
+    if (_debugDiff) fprintf(stderr, "diff t %.4f mean %.3f strong %d last_new %.3f last_repeat %.3f run %d %s\n", received, mean, strong,
+                            diagNew, diagRepeat, diagRun, duplicate ? "repeat" : _sceneCut ? "cut" : "new");
     return duplicate;
 }
 
@@ -463,7 +466,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     CVPixelBufferRelease(_restNative);
     _restNative = NULL;
 
-    if ([self isDuplicate:small]) {
+    if ([self isDuplicate:small received:received]) {
         _restFrame = CVPixelBufferRetain(input);
         _restNative = CVPixelBufferRetain(native);
         _restTime = received;
@@ -477,9 +480,10 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
         if (gap > 0.025 && gap < 0.045) _sourceInterval += 0.1 * (gap - _sourceInterval);
         double period;
         @synchronized (_pending) { period = _period; }
+        double step = MAX(1.0, round(_sourceInterval / 2 / period)) * period;
 
         CVPixelBufferRef middleOut = NULL;
-        if (_previousFrame && gap < 0.100 && !_sceneCut) {
+        if (_previousFrame && gap > 1.5 * step && gap < 0.100 && !_sceneCut) {
             double begin = HostNow();
             CVPixelBufferRef middle = [self interpolateFrom:_previousFrame at:_previousTime to:input at:received];
             _interpSum += HostNow() - begin;
@@ -491,7 +495,6 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
             }
         }
 
-        double step = MAX(1.0, round(_sourceInterval / 2 / period)) * period;
         double afterPrevious = _lastTarget + step;
         double earliest = [self refreshAtOrAfter:HostNow() + kCommitLead];
         if (afterPrevious > earliest + 2 * step + period / 2) afterPrevious = earliest;
