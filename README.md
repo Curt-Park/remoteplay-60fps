@@ -49,7 +49,9 @@ in `dist/`.
    If a warm-up call takes over 25 ms, it uses 720p and upscales the result with
    `VTLowLatencySuperResolutionScaler`. Scene cuts get no middle frame.
 4. **Schedule** the middle frame and the untouched real frame on consecutive display refreshes.
-5. **Present** through a Metal layer in a child window over chiaki-ng, driven by a display link.
+5. **Present** through a Metal layer in a child window over chiaki-ng, driven by a display link and
+   synced to the display refresh. Unsynced, a full-screen picture changed mid-scan and tore along a
+   fixed line during camera moves.
 
 The added delay is about 55–70 ms after a frame is decoded.
 

@@ -287,7 +287,7 @@ static CVPixelBufferPoolRef NewPool(NSDictionary *base, NSInteger width, NSInteg
     layer.device = _device;
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     layer.framebufferOnly = YES;
-    layer.displaySyncEnabled = NO;
+    layer.displaySyncEnabled = YES;
     layer.maximumDrawableCount = 3;
     layer.allowsNextDrawableTimeout = YES;
     CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceITUR_709);
